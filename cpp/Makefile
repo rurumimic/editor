@@ -1,6 +1,6 @@
 CXX=clang++
 CFLAGS=-g -Wall
-FILES=editor.cpp
+FILES=main.cpp
 TARGET=editor
 
 $(TARGET): $(FILES)

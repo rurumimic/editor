@@ -3,8 +3,10 @@
 ## Codes
 
 - C: [kilo.c](c/kilo.c)
-- C++: [editor.cpp](cpp/editor.cpp)
+- C++: [main.cpp](cpp/main.cpp)
 - Rust: [main.rs](rust/editor/src/main.rs)
+- Go: [main.go](go/main.go)
+- Zig: [main.zig](zig/src/main.zig)
 
 ---
 

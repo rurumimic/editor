@@ -1,0 +1,6 @@
+{
+  "files.associations": {
+    "termio.h": "c",
+    "termios.h": "c"
+  }
+}
