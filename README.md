@@ -1,5 +1,13 @@
 # Editor
 
+## Codes
+
+- C: [kilo.c](c/kilo.c)
+- C++: [editor.cpp](cpp/editor.cpp)
+- Rust: [main.rs](rust/editor/src/main.rs)
+
+---
+
 ## Ref
 
 - [antirez's kilo](https://github.com/antirez/kilo)
