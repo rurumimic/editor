@@ -20,7 +20,7 @@ void DisableRawMode() {
 
 void EnableRawMode() {
     if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
-        Die("tcsetattr");
+        Die("tcgetattr");
     atexit(DisableRawMode);
 
     termios raw = orig_termios;
