@@ -46,7 +46,7 @@ void enableRawMode() {
     // disable IXON: disable Ctrl-S and Ctrl-Q signals
     raw.c_oflag &= ~(OPOST);
     // disable OPOST: disable output processing. \n is not translated to \r\n
-    raw.c_cflag |= (CS8);
+    raw.c_cflag |= (CS8); // control mode flags
     // enable CS8: set character size to 8 bits per byte
     raw.c_cc[VMIN] = 0; // minimum number of bytes of input needed before read()
     raw.c_cc[VTIME] = 1; // maximum amount of time to wait before read() returns

@@ -4,6 +4,9 @@
     "termios.h": "c",
     "stdlib.h": "c",
     "random": "c",
-    "queue": "c"
+    "queue": "c",
+    "stdio.h": "c",
+    "cerrno": "cpp",
+    "cstdlib": "cpp"
   }
 }
