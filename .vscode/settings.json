@@ -7,6 +7,8 @@
     "queue": "c",
     "stdio.h": "c",
     "cerrno": "cpp",
-    "cstdlib": "cpp"
+    "cstdlib": "cpp",
+    "ioctl.h": "c",
+    "features.h": "c"
   }
 }
