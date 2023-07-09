@@ -7,6 +7,10 @@
 #include <termio.h>
 #include <unistd.h>
 
+/*** defines ***/
+
+#define CTRL_KEY(k) ((k)&0x1f) // bitwise-AND with 00011111
+
 /*** data ***/
 
 struct termios orig_termios;
@@ -75,7 +79,7 @@ int main() {
             printf("%d ('%c')\r\n", c, c);
         }
 
-        if (c == 'q')
+        if (c == CTRL_KEY('q'))
             break;
     };
     return 0;

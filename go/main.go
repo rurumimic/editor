@@ -14,6 +14,10 @@ import (
 
 var orig_termios unix.Termios
 
+func CtrlKey(k byte) byte {
+	return k & 0x1f
+}
+
 func Die(s string) {
 	fmt.Println(s)
 	os.Exit(1)
@@ -72,7 +76,7 @@ func main() {
 			fmt.Printf("%d ('%c')\r\n", c[0], c[0])
 		}
 
-		if c[0] == 'q' {
+		if c[0] == CtrlKey('q') {
 			break
 		}
 	}

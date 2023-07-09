@@ -2,6 +2,10 @@ const std = @import("std");
 const stdlib = @cImport({@cInclude("stdlib.h");});
 const os = std.os;
 
+fn ctrl_key(k: u8) u8 { 
+    return k & 0x1f; 
+}
+
 var orig_termios: os.termios = undefined;
 
 fn die(s: []const u8) noreturn {
@@ -53,7 +57,7 @@ pub fn main() !void {
             std.debug.print("{d} ('{c}')\r\n", .{c[0], c[0]});
         }
 
-        if (c[0] == 'q') {
+        if (c[0] == ctrl_key('q')) {
             break;
         }
     }

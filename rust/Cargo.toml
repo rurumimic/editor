@@ -6,4 +6,3 @@ publish = false
 
 [dependencies]
 termios = "0.3.3"
-

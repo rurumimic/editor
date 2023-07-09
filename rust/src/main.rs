@@ -3,6 +3,12 @@ use std::os::unix::io::AsRawFd;
 
 use termios::*;
 
+macro_rules! ctrl_key {
+    ($k:expr) => {
+        $k & 0x1f
+    };
+}
+
 struct RawMode(Termios);
 
 impl Drop for RawMode {
@@ -52,7 +58,7 @@ fn main() {
             print!("{:?} ('{}')\r\n", c, c[0] as char);
         }
 
-        if c[0] == b'q' {
+        if c[0] == ctrl_key!(b'q') {
             break;
         }
     }
