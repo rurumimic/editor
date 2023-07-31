@@ -16,7 +16,7 @@
 #define CTRL_KEY(k) ((k)&0x1f) // bitwise-AND with 00011111
 
 enum editorKey {
-  ARROW_LEFT = 1000,
+  ARROW_LEFT = 1000, //avoid conflict with any ordinary keypresses
   ARROW_RIGHT,
   ARROW_UP,
   ARROW_DOWN,
@@ -96,8 +96,10 @@ int editorReadKey() {
     if (nread == -1 && errno != EAGAIN)
       die("read");
   }
+
+  // Arrow keys
   if (c == '\x1b') {
-    char seq[3];
+    char seq[3]; // for longer escape sequences
     if (read(STDIN_FILENO, &seq[0], 1) != 1)
       return '\x1b';
     if (read(STDIN_FILENO, &seq[1], 1) != 1)
@@ -168,8 +170,9 @@ int getCursorPosition(int *rows, int *cols) {
       break;
     i++;
   }
-  buf[i] = '\0';
+  buf[i] = '\0'; // for printf, end with a 0
 
+  // skip first escape character 
   if (buf[0] != '\x1b' || buf[1] != '[')
     return -1;
   if (sscanf(&buf[2], "%d;%d", rows, cols) != 2)
@@ -184,9 +187,9 @@ int getWindowSize(int *rows, int *cols) {
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
     if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
       return -1;
-    return getCursorPosition(rows, cols);
+    return getCursorPosition(rows, cols); // return: <esc>[29;109R
   } else {
-    *cols = ws.ws_col;
+    *cols = ws.ws_col; // set values
     *rows = ws.ws_row;
     return 0;
   }
@@ -221,6 +224,7 @@ void abFree(struct abuf *ab) { free(ab->b); }
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
+    /* welcom message */
     if (y == E.screenrows / 3) {
       char welcome[80];
       int welcomelen = snprintf(welcome, sizeof(welcome),
@@ -239,7 +243,7 @@ void editorDrawRows(struct abuf *ab) {
       abAppend(ab, "~", 1);
     }
 
-    abAppend(ab, "\x1b[K", 3);
+    abAppend(ab, "\x1b[K", 3); // Erase In Line: https://vt100.net/docs/vt100-ug/chapter3.html#EL
     if (y < E.screenrows - 1) {
       abAppend(ab, "\r\n", 2);
     }
@@ -248,20 +252,19 @@ void editorDrawRows(struct abuf *ab) {
 
 void editorRefreshScreen() {
   struct abuf ab = ABUF_INIT;
-  // write 4 bytes to the terminal
-  // \x1b is the escape character = 27
-  // [2J is the escape sequence to clear the screen
-  abAppend(&ab, "\x1b[?25l", 6);
-  abAppend(&ab, "\x1b[H", 3);
-
+  // https://vt100.net/docs/vt100-ug/chapter3.html#ED
+  // ESC [ Ps J: Erase In Display
+  // Ps 2: Erase all of the display
+  abAppend(&ab, "\x1b[?25l", 6); // write 6 bytes. https://vt100.net/docs/vt510-rm/DECTCEM.html
+  abAppend(&ab, "\x1b[H", 3); // CUP – Cursor Position
+ 
   editorDrawRows(&ab);
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1[%d;%dH", E.cy + 1, E.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1); // exact cursor position
   abAppend(&ab, buf, strlen(buf));
 
-  abAppend(&ab, "\x1b[H", 3);
-  abAppend(&ab, "\x1b[?25h", 6);
+  abAppend(&ab, "\x1b[?25h", 6); // https://vt100.net/docs/vt100-ug/chapter3.html#SM 
 
   write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
@@ -273,7 +276,7 @@ void editorMoveCursor(int key) {
   switch (key) {
   case ARROW_LEFT:
     if (E.cx != 0) {
-      E.cx--;
+      E.cx--; // prevent moving the cursor off screen
     }
     break;
   case ARROW_RIGHT:
@@ -318,6 +321,7 @@ void editorProcessKeypress() {
       editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
   } break;
 
+  // cursor move
   case ARROW_UP:
   case ARROW_DOWN:
   case ARROW_LEFT:
@@ -341,6 +345,7 @@ int main() {
   initEditor();
 
   while (1) {
+    editorRefreshScreen();
     editorProcessKeypress();
   };
   return 0;
