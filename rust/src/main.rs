@@ -1,5 +1,6 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::process::exit;
 
 use termios::*;
 
@@ -37,29 +38,52 @@ fn enable_raw_mode() -> RawMode {
     return RawMode(orig_termios);
 }
 
-fn main() {
-    let _raw_mode = enable_raw_mode();
-
+fn editor_read_key() -> u8 {
     loop {
         let mut c = [0u8; 1];
 
         match io::stdin().read_exact(&mut c) {
-            Ok(_) => {}
+            Ok(_) => { return c[0]; },
             Err(e) => {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
+                    _ = io::stdout().write(b"\x1b[2J");
+                    _ = io::stdout().write(b"\x1b[H");
+
                     panic!("read error: {}", e);
                 }
             }
         }
+    }
+}
 
+fn editor_refresh_screen() {
+    _ = io::stdout().write(b"\x1b[2J");
+    _ = io::stdout().write(b"\x1b[H");
+}
+
+fn editor_process_keypress() {
+    let c = editor_read_key();
+
+    if c == ctrl_key!(b'q') {
+        _ = io::stdout().write(b"\x1b[2J");
+        _ = io::stdout().write(b"\x1b[H");
+        exit(1);
+    }
+}
+
+fn main() {
+    let _raw_mode = enable_raw_mode();
+
+    loop {
+        editor_refresh_screen();
+        editor_process_keypress();
+
+        /*
         if c[0].is_ascii_control() {
             print!("{}\r\n", c[0]);
         } else {
             print!("{:?} ('{}')\r\n", c, c[0] as char);
         }
-
-        if c[0] == ctrl_key!(b'q') {
-            break;
-        }
+        */
     }
 }
