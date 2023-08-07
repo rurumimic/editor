@@ -1,6 +1,9 @@
+#![allow(dead_code, unused)]
+
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::exit;
+use std::process::ExitCode;
+use std::error;
 
 use termios::*;
 
@@ -16,6 +19,13 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         disable_raw_mode(self);
     }
+}
+
+fn die(s: &str, e: io::Error) {
+    _ = io::stdout().write(b"\x1b[2J");
+    _ = io::stdout().write(b"\x1b[H");
+
+    panic!("{}: {}", s, e);
 }
 
 fn disable_raw_mode(orig_termios: &mut RawMode) {
@@ -39,17 +49,14 @@ fn enable_raw_mode() -> RawMode {
 }
 
 fn editor_read_key() -> u8 {
-    loop {
-        let mut c = [0u8; 1];
+    let mut c = [0u8; 1];
 
+    loop {
         match io::stdin().read_exact(&mut c) {
             Ok(_) => { return c[0]; },
             Err(e) => {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
-                    _ = io::stdout().write(b"\x1b[2J");
-                    _ = io::stdout().write(b"\x1b[H");
-
-                    panic!("read error: {}", e);
+                    die("Read Key Error", e);
                 }
             }
         }
@@ -61,22 +68,26 @@ fn editor_refresh_screen() {
     _ = io::stdout().write(b"\x1b[H");
 }
 
-fn editor_process_keypress() {
+fn editor_process_keypress() -> Option<ExitCode> {
     let c = editor_read_key();
 
     if c == ctrl_key!(b'q') {
         _ = io::stdout().write(b"\x1b[2J");
         _ = io::stdout().write(b"\x1b[H");
-        exit(1);
+        return Some(ExitCode::SUCCESS);
     }
+
+    return None;
 }
 
-fn main() {
+fn main() -> ExitCode {
     let _raw_mode = enable_raw_mode();
 
     loop {
         editor_refresh_screen();
-        editor_process_keypress();
+        if editor_process_keypress().is_some() {
+            break;
+        }
 
         /*
         if c[0].is_ascii_control() {
@@ -86,4 +97,6 @@ fn main() {
         }
         */
     }
+
+    ExitCode::SUCCESS
 }
