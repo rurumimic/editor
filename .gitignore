@@ -1,5 +1,5 @@
-# Created by https://www.toptal.com/developers/gitignore/api/c,go,c++,vim,rust,emacs,linux,macos,windows,visualstudiocode,zig
-# Edit at https://www.toptal.com/developers/gitignore?templates=c,go,c++,vim,rust,emacs,linux,macos,windows,visualstudiocode,zig
+# Created by https://www.toptal.com/developers/gitignore/api/c,go,c++,vim,zig,rust,emacs,linux,macos,windows,visualstudiocode,tags
+# Edit at https://www.toptal.com/developers/gitignore?templates=c,go,c++,vim,zig,rust,emacs,linux,macos,windows,visualstudiocode,tags
 
 ### C ###
 # Prerequisites
@@ -205,6 +205,25 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 
+### Tags ###
+# Ignore tags created by etags, ctags, gtags (GNU global) and cscope
+TAGS
+.TAGS
+!TAGS/
+tags
+.tags
+!tags/
+gtags.files
+GTAGS
+GRTAGS
+GPATH
+GSYMS
+cscope.files
+cscope.out
+cscope.in.out
+cscope.po.out
+
+
 ### Vim ###
 # Swap
 [._]*.s[a-v][a-z]
@@ -221,7 +240,6 @@ Sessionx.vim
 # Temporary
 .netrwhist
 # Auto-generated tag files
-tags
 # Persistent undo
 [._]*.un~
 
@@ -279,4 +297,5 @@ build/
 build-*/
 docgen_tmp/
 
-# End of https://www.toptal.com/developers/gitignore/api/c,go,c++,vim,rust,emacs,linux,macos,windows,visualstudiocode,zig
+# End of https://www.toptal.com/developers/gitignore/api/c,go,c++,vim,zig,rust,emacs,linux,macos,windows,visualstudiocode,tags
+
