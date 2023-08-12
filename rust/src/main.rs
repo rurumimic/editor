@@ -1,6 +1,7 @@
 #![allow(dead_code, unused)]
 
 use std::error;
+use std::cmp;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 
@@ -8,6 +9,8 @@ use nix::libc::{ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
 use nix::sys::ioctl::*;
 use termios::*;
+
+const EDITOR_VERSION: &'static str = "0.0.1";
 
 macro_rules! ctrl_key {
     ($k:expr) => {
@@ -140,35 +143,104 @@ fn get_window_size() -> Option<(u16, u16)> {
     Some((ws.ws_row, ws.ws_col))
 }
 
-fn editor_draw_rows(conf: &EditorConfig) {
-    for y in 0..conf.screenrows {
-        _ = io::stdout().write(b"~");
+struct Abuf {
+    b: String,
+}
 
+impl Abuf {
+    fn new() -> Abuf {
+        Abuf{ b: String::new() }
+    }
+
+    fn append(&mut self, s: &str) {
+        self.b.push_str(s);
+    }
+}
+
+fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
+    for y in 0..conf.screenrows {
+        if y == conf.screenrows / 3 {
+            let welcome = format!("The Editor -- version {}", EDITOR_VERSION);
+            let welcomelen = cmp::min(welcome.len(), conf.screencols.into());
+            let mut padding = (conf.screencols - welcomelen as u16) / 2;
+            if padding > 0 {
+                ab.append("~");
+                padding -= 1;
+            }
+            while padding > 0 {
+                ab.append(" ");
+                padding -= 1;
+            }
+            ab.append(&welcome[..welcomelen]);
+        } else {
+            ab.append("~");
+        }
+
+        ab.append("\x1b[K");
         if y < conf.screenrows - 1 {
-            _ = io::stdout().write(b"\r\n");
+            ab.append("\r\n");
         }
     }
 }
 
 fn editor_refresh_screen(conf: &EditorConfig) {
-    _ = io::stdout().write(b"\x1b[2J");
-    _ = io::stdout().write(b"\x1b[H");
+    let mut ab = Abuf::new();
 
-    editor_draw_rows(&conf);
+    ab.append("\x1b[?25l");
+    ab.append("\x1b[H");
+    editor_draw_rows(&conf, &mut ab);
 
-    _ = io::stdout().write(b"\x1b[H");
+    let x = conf.cx + 1;
+    let y = conf.cy + 1;
+    let cursor = format!("\x1b[{};{}H", y, x);
+    ab.append(&cursor);
+
+    ab.append("\x1b[?25h");
+
+    _ = io::stdout().write(ab.b.as_bytes());
 }
 
-fn editor_process_keypress() -> bool {
+fn editor_move_cursor(key: u8, conf: &mut EditorConfig) {
+    match key {
+        b'w' => {
+            if conf.cy != 0 {
+                conf.cy -= 1;
+            }
+        },
+        b's' => {
+            if conf.cy != conf.screenrows - 1 {
+                conf.cy += 1;
+            }
+        },
+        b'a' => {
+            if conf.cx != 0 {
+                conf.cx -= 1;
+            }
+        },
+        b'd' => {
+            if conf.cx != conf.screencols - 1 {
+                conf.cx += 1;
+            }
+        },
+        _ => {},
+    }
+}
+
+fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
     let c = editor_read_key();
 
     if c == ctrl_key!(b'q') {
         _ = io::stdout().write(b"\x1b[2J");
         _ = io::stdout().write(b"\x1b[H");
-        false
-    } else {
-        true
+        return false;
     }
+
+    match c {
+        b'w'|b's'|b'a'|b'd' => editor_move_cursor(c, conf),
+        _ => {},
+    }
+
+    true
 }
 
 fn init_editor(conf: &mut EditorConfig) -> bool {
@@ -176,6 +248,8 @@ fn init_editor(conf: &mut EditorConfig) -> bool {
         return false;
     };
 
+    conf.cx = 0;
+    conf.cy = 0;
     conf.screenrows = row;
     conf.screencols = col;
     true
@@ -189,17 +263,9 @@ fn main() {
 
     loop {
         editor_refresh_screen(&conf);
-        if editor_process_keypress() == false {
+        if editor_process_keypress(&mut conf) == false {
             break;
         }
-
-        /*
-        if c[0].is_ascii_control() {
-            print!("{}\r\n", c[0]);
-        } else {
-            print!("{:?} ('{}')\r\n", c, c[0] as char);
-        }
-        */
     }
 
     print!("Editor ");
