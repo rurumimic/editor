@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
-	"syscall"
-	"unicode"
+	// "os/signal"
+	// "syscall"
+	// "unicode"
 
 	"github.com/pkg/term/termios"
 	"golang.org/x/sys/unix"
+)
+
+type ExitCode int8
+
+const (
+  SUCCESS ExitCode = iota
+  FAILURE
 )
 
 var orig_termios unix.Termios
@@ -18,31 +25,24 @@ func CtrlKey(k byte) byte {
 	return k & 0x1f
 }
 
-func Die(s string) {
+func Die(s string, err error) error {
 	fmt.Println(s)
-	os.Exit(1)
+	return err
 }
 
-func DisableRawMode() {
+func DisableRawMode() error {
 	err := termios.Tcsetattr(os.Stdin.Fd(), termios.TCSAFLUSH, &orig_termios)
 	if err != nil {
-		Die("Tcsetattr")
+		return Die("Tcsetattr", err)
 	}
+  return nil
 }
 
-func EnableRawMode() {
+func EnableRawMode() error {
 	err := termios.Tcgetattr(os.Stdin.Fd(), &orig_termios)
 	if err != nil {
-		Die("Tcgetattr")
+		return Die("Tcgetattr", err)
 	}
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		DisableRawMode()
-		os.Exit(1)
-	}()
 
 	var raw unix.Termios = orig_termios
 
@@ -55,30 +55,58 @@ func EnableRawMode() {
 
 	err = termios.Tcsetattr(os.Stdin.Fd(), termios.TCSAFLUSH, &raw)
 	if err != nil {
-		Die("Tcsetattr")
+		return Die("Tcsetattr", err)
 	}
+  return nil
+}
+
+func EditorReadKey() (byte, error) {
+    var c []byte = make([]byte, 1)
+
+    for {
+      _, err := os.Stdin.Read(c)
+      if err != nil && err != io.EOF {
+        return 0, Die("ReadKey", err)
+      }
+      return c[0], nil
+    }	
+}
+
+func EditorRefreshScreen() {
+  os.Stdout.WriteString("\x1b[2J")
+  os.Stdout.WriteString("\x1b[H")
+}
+
+func EditorProcessKeypress() ExitCode {
+  c, err := EditorReadKey()
+  if err != nil {
+    return FAILURE
+  }
+
+  if c == CtrlKey('q') {
+    os.Stdout.WriteString("\x1b[2J")
+    os.Stdout.WriteString("\x1b[H")
+    return FAILURE
+  }
+
+  return SUCCESS
 }
 
 func main() {
 	EnableRawMode()
+  defer DisableRawMode()
 
 	for {
-		var c []byte = make([]byte, 1)
+	  EditorRefreshScreen()
+    if EditorProcessKeypress() == FAILURE {
+      break
+    }
 
-		_, err := os.Stdin.Read(c)
-		if err != nil && err != io.EOF {
-			Die("Read")
-		}
-
-		if unicode.IsControl(rune(c[0])) {
-			fmt.Printf("%d\r\n", c[0])
-		} else {
-			fmt.Printf("%d ('%c')\r\n", c[0], c[0])
-		}
-
-		if c[0] == CtrlKey('q') {
-			break
-		}
+		// if unicode.IsControl(rune(c[0])) {
+		// 	fmt.Printf("%d\r\n", c[0])
+		// } else {
+		// 	fmt.Printf("%d ('%c')\r\n", c[0], c[0])
+		// }
 	}
 
 }

@@ -80,7 +80,7 @@ fn editor_process_keypress() -> Option<ExitCode> {
     return None;
 }
 
-fn main() -> ExitCode {
+fn main() {
     let _raw_mode = enable_raw_mode();
 
     loop {
@@ -98,5 +98,4 @@ fn main() -> ExitCode {
         */
     }
 
-    ExitCode::SUCCESS
 }
