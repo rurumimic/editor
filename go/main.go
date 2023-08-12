@@ -26,6 +26,8 @@ func CtrlKey(k byte) byte {
 }
 
 func Die(s string, err error) error {
+  os.Stdout.WriteString("\x1b[2J")
+  os.Stdout.WriteString("\x1b[H")
 	fmt.Println(s)
 	return err
 }
@@ -70,6 +72,10 @@ func EditorReadKey() (byte, error) {
       }
       return c[0], nil
     }	
+}
+
+func EditorDrawRows() {
+
 }
 
 func EditorRefreshScreen() {
