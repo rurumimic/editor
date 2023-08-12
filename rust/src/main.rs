@@ -1,9 +1,8 @@
 #![allow(dead_code, unused)]
 
+use std::error;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::process::ExitCode;
-use std::error;
 
 use nix::libc::{ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
@@ -43,7 +42,7 @@ fn die(s: &str, e: io::Error) {
 
 fn disable_raw_mode(orig_termios: &mut RawMode) {
     tcsetattr(io::stdin().as_raw_fd(), TCSAFLUSH, &orig_termios.0).unwrap();
-    // println!("Editor Closed.");
+    println!("Closed.");
 }
 
 fn enable_raw_mode() -> EditorConfig {
@@ -60,11 +59,11 @@ fn enable_raw_mode() -> EditorConfig {
     tcsetattr(io::stdin().as_raw_fd(), TCSAFLUSH, &raw).unwrap();
 
     EditorConfig {
-        cx : 0,
-        cy : 0,
-        screenrows : 0,
-        screencols : 0,
-        orig_termios : RawMode(orig_termios),
+        cx: 0,
+        cy: 0,
+        screenrows: 0,
+        screencols: 0,
+        orig_termios: RawMode(orig_termios),
     }
 }
 
@@ -73,7 +72,9 @@ fn editor_read_key() -> u8 {
 
     loop {
         match io::stdin().read_exact(&mut c) {
-            Ok(_) => { return c[0]; },
+            Ok(_) => {
+                return c[0];
+            }
             Err(e) => {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     die("Read Key Error", e);
@@ -112,16 +113,20 @@ fn get_cursor_position() -> Option<(u16, u16)> {
     if parts.len() != 2 {
         return None;
     }
+
     let x = parts[0].parse::<u16>().ok()?;
     let y = parts[1].parse::<u16>().ok()?;
-
-    println!("{}, {}", x, y);
 
     Some((x, y))
 }
 
 fn get_window_size() -> Option<(u16, u16)> {
-    let mut ws = Winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut ws = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
 
     unsafe {
         if (ioctl(io::stdout().as_raw_fd(), TIOCGWINSZ, &mut ws) == -1 || ws.ws_col == 0) {
@@ -154,16 +159,16 @@ fn editor_refresh_screen(conf: &EditorConfig) {
     _ = io::stdout().write(b"\x1b[H");
 }
 
-fn editor_process_keypress() -> Option<ExitCode> {
+fn editor_process_keypress() -> bool {
     let c = editor_read_key();
 
     if c == ctrl_key!(b'q') {
         _ = io::stdout().write(b"\x1b[2J");
         _ = io::stdout().write(b"\x1b[H");
-        return Some(ExitCode::SUCCESS);
+        false
+    } else {
+        true
     }
-
-    None
 }
 
 fn init_editor(conf: &mut EditorConfig) -> bool {
@@ -178,13 +183,13 @@ fn init_editor(conf: &mut EditorConfig) -> bool {
 
 fn main() {
     let mut conf: EditorConfig = enable_raw_mode();
-    if !init_editor(&mut conf) {
+    if init_editor(&mut conf) == false {
         return;
     }
 
     loop {
         editor_refresh_screen(&conf);
-        if editor_process_keypress().is_some() {
+        if editor_process_keypress() == false {
             break;
         }
 
@@ -197,5 +202,5 @@ fn main() {
         */
     }
 
+    print!("Editor ");
 }
-
