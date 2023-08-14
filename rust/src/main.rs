@@ -2,10 +2,11 @@
 
 use std::error;
 use std::cmp;
+use std::str;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 
-use nix::libc::{ioctl, TIOCGWINSZ};
+use nix::libc::{self, ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
 use nix::sys::ioctl::*;
 use termios::*;
@@ -36,6 +37,18 @@ struct EditorConfig {
     orig_termios: RawMode,
 }
 
+fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
+    let ret = unsafe {
+        libc::write(libc::STDOUT_FILENO, buf.as_ptr() as *const libc::c_void, buf.len())
+    };
+
+    if ret == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
 fn die(s: &str, e: io::Error) {
     _ = io::stdout().write(b"\x1b[2J");
     _ = io::stdout().write(b"\x1b[H");
@@ -45,7 +58,6 @@ fn die(s: &str, e: io::Error) {
 
 fn disable_raw_mode(orig_termios: &mut RawMode) {
     tcsetattr(io::stdin().as_raw_fd(), TCSAFLUSH, &orig_termios.0).unwrap();
-    println!("Closed.");
 }
 
 fn enable_raw_mode() -> EditorConfig {
@@ -88,39 +100,23 @@ fn editor_read_key() -> u8 {
 }
 
 fn get_cursor_position() -> Option<(u16, u16)> {
-    let mut buf = [0u8; 32];
-    let mut i = 0;
-
     if io::stdout().write(b"\x1b[6n").is_err() {
         return None;
     }
+    io::stdout().flush().ok()?;
 
-    while i < buf.len() - 1 {
-        if io::stdin().read(&mut buf).unwrap() != 1 {
-            break;
-        }
-        if buf[i] == b'R' {
-            break;
-        }
-        i += 1;
+    let mut buf = Vec::new();
+    io::stdin().read_to_end(&mut buf).ok()?;
+
+    if let Some(pos) = String::from_utf8_lossy(&buf).find('R') {
+        let row_col = String::from_utf8_lossy(&buf[2..pos]);
+        let coordinates: Vec<&str> = row_col.split(';').collect();
+        let row = coordinates[0].parse::<usize>().ok()? as u16;
+        let col = coordinates[1].parse::<usize>().ok()? as u16;
+        return Some((row, col))
     }
 
-    if buf[0] != b'\x1b' || buf[1] != b'[' {
-        return None;
-    }
-
-    let slice = &buf[2..i];
-    let pos = std::str::from_utf8(slice).ok()?;
-    let parts: Vec<&str> = pos.split(';').collect();
-
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let x = parts[0].parse::<u16>().ok()?;
-    let y = parts[1].parse::<u16>().ok()?;
-
-    Some((x, y))
+    None
 }
 
 fn get_window_size() -> Option<(u16, u16)> {
@@ -188,16 +184,16 @@ fn editor_refresh_screen(conf: &EditorConfig) {
 
     ab.append("\x1b[?25l");
     ab.append("\x1b[H");
+
     editor_draw_rows(&conf, &mut ab);
 
-    let x = conf.cx + 1;
-    let y = conf.cy + 1;
-    let cursor = format!("\x1b[{};{}H", y, x);
-    ab.append(&cursor);
+    let cursor = format!("\x1b[{};{}H", conf.cy + 1, conf.cx + 1);
+    ab.append(cursor.as_str());
 
     ab.append("\x1b[?25h");
 
     _ = io::stdout().write(ab.b.as_bytes());
+    _ = io::stdout().flush();
 }
 
 fn editor_move_cursor(key: u8, conf: &mut EditorConfig) {
@@ -267,6 +263,4 @@ fn main() {
             break;
         }
     }
-
-    print!("Editor ");
 }
