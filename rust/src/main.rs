@@ -1,10 +1,10 @@
 #![allow(dead_code, unused)]
 
-use std::error;
 use std::cmp;
-use std::str;
+use std::error;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::str;
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
@@ -17,6 +17,21 @@ macro_rules! ctrl_key {
     ($k:expr) => {
         $k & 0x1f
     };
+}
+
+#[repr(u8)]
+enum EditorKey {
+    Key(u8),
+    Esc = b'\x1b',
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    DelKey,
+    HomeKey,
+    EndKey,
+    PageUp,
+    PageDown,
 }
 
 #[derive(Debug)]
@@ -39,7 +54,11 @@ struct EditorConfig {
 
 fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
     let ret = unsafe {
-        libc::write(libc::STDOUT_FILENO, buf.as_ptr() as *const libc::c_void, buf.len())
+        libc::write(
+            libc::STDOUT_FILENO,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+        )
     };
 
     if ret == -1 {
@@ -52,7 +71,6 @@ fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
 fn die(s: &str, e: io::Error) {
     _ = io::stdout().write(b"\x1b[2J");
     _ = io::stdout().write(b"\x1b[H");
-
     panic!("{}: {}", s, e);
 }
 
@@ -82,13 +100,13 @@ fn enable_raw_mode() -> EditorConfig {
     }
 }
 
-fn editor_read_key() -> u8 {
+fn editor_read_key() -> EditorKey {
     let mut c = [0u8; 1];
 
     loop {
         match io::stdin().read_exact(&mut c) {
             Ok(_) => {
-                return c[0];
+                break;
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
@@ -97,6 +115,58 @@ fn editor_read_key() -> u8 {
             }
         }
     }
+
+    if c[0] == b'\x1b' {
+        let mut seq0 = [0u8; 1];
+        let mut seq1 = [0u8; 1];
+        let mut seq2 = [0u8; 1];
+        if io::stdin().read_exact(&mut seq0).is_err() {
+            return EditorKey::Esc;
+        }
+        if io::stdin().read_exact(&mut seq1).is_err() {
+            return EditorKey::Esc;
+        }
+
+        if seq0[0] == b'[' {
+            if seq1[0] >= b'0' && seq1[0] <= b'9' {
+                if io::stdin().read_exact(&mut seq2).is_err() {
+                    return EditorKey::Esc;
+                }
+                if seq2[0] == b'~' {
+                    match seq1[0] {
+                        b'1' => return EditorKey::HomeKey,
+                        b'3' => return EditorKey::DelKey,
+                        b'4' => return EditorKey::EndKey,
+                        b'5' => return EditorKey::PageUp,
+                        b'6' => return EditorKey::PageDown,
+                        b'7' => return EditorKey::HomeKey,
+                        b'8' => return EditorKey::EndKey,
+                        _ => {}
+                    }
+                }
+            } else {
+                match seq1[0] {
+                    b'A' => return EditorKey::ArrowUp,
+                    b'B' => return EditorKey::ArrowDown,
+                    b'C' => return EditorKey::ArrowRight,
+                    b'D' => return EditorKey::ArrowLeft,
+                    b'H' => return EditorKey::HomeKey,
+                    b'F' => return EditorKey::EndKey,
+                    _ => {}
+                }
+            }
+        } else if seq0[0] == b'O' {
+            match seq1[0] {
+                b'H' => return EditorKey::HomeKey,
+                b'F' => return EditorKey::EndKey,
+                _ => {},
+            }
+        }
+
+        return EditorKey::Esc;
+    }
+
+    EditorKey::Key(c[0])
 }
 
 fn get_cursor_position() -> Option<(u16, u16)> {
@@ -113,7 +183,7 @@ fn get_cursor_position() -> Option<(u16, u16)> {
         let coordinates: Vec<&str> = row_col.split(';').collect();
         let row = coordinates[0].parse::<usize>().ok()? as u16;
         let col = coordinates[1].parse::<usize>().ok()? as u16;
-        return Some((row, col))
+        return Some((row, col));
     }
 
     None
@@ -145,7 +215,7 @@ struct Abuf {
 
 impl Abuf {
     fn new() -> Abuf {
-        Abuf{ b: String::new() }
+        Abuf { b: String::new() }
     }
 
     fn append(&mut self, s: &str) {
@@ -196,44 +266,61 @@ fn editor_refresh_screen(conf: &EditorConfig) {
     _ = io::stdout().flush();
 }
 
-fn editor_move_cursor(key: u8, conf: &mut EditorConfig) {
+fn editor_move_cursor(key: EditorKey, conf: &mut EditorConfig) {
     match key {
-        b'w' => {
+        EditorKey::ArrowUp => {
             if conf.cy != 0 {
                 conf.cy -= 1;
             }
-        },
-        b's' => {
+        }
+        EditorKey::ArrowDown => {
             if conf.cy != conf.screenrows - 1 {
                 conf.cy += 1;
             }
-        },
-        b'a' => {
+        }
+        EditorKey::ArrowLeft => {
             if conf.cx != 0 {
                 conf.cx -= 1;
             }
-        },
-        b'd' => {
+        }
+        EditorKey::ArrowRight => {
             if conf.cx != conf.screencols - 1 {
                 conf.cx += 1;
             }
-        },
-        _ => {},
+        }
+        _ => {}
     }
 }
 
 fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
     let c = editor_read_key();
 
-    if c == ctrl_key!(b'q') {
-        _ = io::stdout().write(b"\x1b[2J");
-        _ = io::stdout().write(b"\x1b[H");
-        return false;
+    if let EditorKey::Key(key) = c {
+        if key == ctrl_key!(b'q') {
+            _ = io::stdout().write(b"\x1b[2J");
+            _ = io::stdout().write(b"\x1b[H");
+            return false;
+        }
     }
 
     match c {
-        b'w'|b's'|b'a'|b'd' => editor_move_cursor(c, conf),
-        _ => {},
+        EditorKey::HomeKey => conf.cx = 0, 
+        EditorKey::EndKey => conf.cx = conf.screencols - 1,
+        EditorKey::PageUp | EditorKey::PageDown => {
+            let mut times = conf.screenrows;
+            while times > 0 {
+                times -= 1;
+                match c {
+                    EditorKey::PageUp => editor_move_cursor(EditorKey::ArrowUp, conf),
+                    _ => editor_move_cursor(EditorKey::ArrowDown, conf),
+                }
+            }
+        }
+        EditorKey::ArrowUp
+        | EditorKey::ArrowDown
+        | EditorKey::ArrowLeft
+        | EditorKey::ArrowRight => editor_move_cursor(c, conf),
+        _ => {}
     }
 
     true
