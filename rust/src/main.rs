@@ -159,7 +159,7 @@ fn editor_read_key() -> EditorKey {
             match seq1[0] {
                 b'H' => return EditorKey::HomeKey,
                 b'F' => return EditorKey::EndKey,
-                _ => {},
+                _ => {}
             }
         }
 
@@ -304,7 +304,7 @@ fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
     }
 
     match c {
-        EditorKey::HomeKey => conf.cx = 0, 
+        EditorKey::HomeKey => conf.cx = 0,
         EditorKey::EndKey => conf.cx = conf.screencols - 1,
         EditorKey::PageUp | EditorKey::PageDown => {
             let mut times = conf.screenrows;
