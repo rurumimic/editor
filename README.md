@@ -2,18 +2,20 @@
 
 ## Code
 
-- C: [kilo.c](c/kilo.c)
-- C++: [main.cpp](cpp/main.cpp)
-- Go: [main.go](go/main.go)
-- Rust: [main.rs](rust/src/main.rs)
-- Zig: [main.zig](zig/src/main.zig)
+| lang | file | progress |
+|---|---|---|
+| C | [kilo.c](c/kilo.c) | [■■■   ] |
+| C++ | [main.cpp](cpp/main.cpp) | [■     ] |
+| Go | [main.go](go/main.go) | [■■    ] |
+| Rust | [main.rs](rust/src/main.rs) | [■■■   ] |
+| Zig | [main.zig](zig/src/main.zig) | [■     ] |
 
 ## Build and Run
 
 ```bash
 # c
 make
-./kilo
+./kilo kilo.c
 
 # c++
 make
@@ -23,7 +25,7 @@ make
 go run .
 
 # rust
-cargo run
+cargo run -- src/main.rs
 
 # zig
 zig build run
@@ -39,3 +41,4 @@ zig build run
 - [Avery Laird](https://www.averylaird.com/programming/the%20text%20editor/2017/09/30/the-piece-table): Text Editor - Data Structures
 - [Cameron DaCamara](https://cdacamar.github.io/data%20structures/algorithms/benchmarking/text%20editors/c++/editor-data-structures/): Text Editor Data Structures
 - [Tsoding Daily](https://youtu.be/2UY_Am-Q-oI): Writing Text Editor
+
