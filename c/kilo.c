@@ -7,16 +7,19 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /*** defines ***/
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
 
 #define CTRL_KEY(k) ((k)&0x1f) // bitwise-AND with 00011111
 
@@ -34,19 +37,25 @@ enum editorKey {
 
 /*** data ***/
 
-typedef struct erow {
+typedef struct erow { // editor row
   int size;
+  int rsize;
   char *chars;
+  char *render;
 } erow;
 
 struct editorConfig {
-  int cx, cy;
+  int cx, cy; // cursor index
+  int rx;     // render index
   int rowoff;
   int coloff;
   int screenrows;
   int screencols;
   int numrows;
   erow *row;
+  char *filename;
+  char statusmsg[80];
+  time_t statusmsg_time;
   struct termios orig_termios;
 };
 
@@ -211,33 +220,97 @@ int getWindowSize(int *rows, int *cols) {
 
 /*** row operations ***/
 
+int editorRowCxToRx(erow *row, int cx) {
+  int rx = 0;
+  int j;
+  for (j = 0; j < cx; j++) {
+    if (row->chars[j] == '\t') {
+      /* raw file:
+       * >123>1234567>1
+       * >>1
+       *
+       * render:
+       * -------8-------8-------8----
+       * ........123.....1234567.1
+       * ................1
+       */
+      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+    }
+    rx++;
+  }
+  return rx;
+}
+
+void editorUpdateRow(erow *row) {
+  int tabs = 0;
+  int j;
+
+  for (j = 0; j < row->size; j++) {
+    if (row->chars[j] == '\t') {
+      tabs++;
+    }
+  }
+
+  free(row->render);
+  row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+
+  int idx = 0;
+  for (j = 0; j < row->size; j++) {
+    if (row->chars[j] == '\t') {
+      row->render[idx++] = ' '; // counts 1 for each tab
+      while (idx % KILO_TAB_STOP != 0) {
+        row->render[idx++] = ' '; // add 7 spaces
+      }
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+  row->render[idx] = '\0';
+  row->rsize = idx;
+}
+
 void editorAppendRow(char *s, size_t len) {
+  // allocate space for a new erow of struct E (editorConfig)
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
 
-  int at = E.numrows;
-  E.row[at].size = len;
-  E.row[at].chars = malloc(len + 1);
-  memcpy(E.row[at].chars, s, len);
+  int at = E.numrows;                // last line number
+  E.row[at].size = len;              // new line length
+  E.row[at].chars = malloc(len + 1); // allocate for a new line
+
+  /* void *memcpy(void *dst, const void *src, size_t n) */
+  memcpy(E.row[at].chars, s, len); // copy the string to a new line
+
   E.row[at].chars[len] = '\0';
+
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
+  editorUpdateRow(&E.row[at]);
+
   E.numrows++;
 }
 
 /*** file i/o ***/
 
 void editorOpen(char *filename) {
+  free(E.filename);
+  E.filename = strdup(filename);
+
   FILE *fp = fopen(filename, "r");
-  if (!fp)
+  if (!fp) {
     die("fopen");
+  }
 
   char *line = NULL;
-  size_t linecap = 0;
-  ssize_t linelen;
+  size_t linecap = 0; // line capacity: how much memory it allocated
+  ssize_t linelen;    // length of the line it read. EOF: -1
 
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
     while (linelen > 0 &&
-           (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
-      linelen--;
-    editorAppendRow(line, linelen);
+           (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+      linelen--; // strip off the new line or carriage return at the end of the
+                 // line
+    }
+    editorAppendRow(line, linelen); // copy the line into our erow
   }
 
   free(line);
@@ -271,17 +344,23 @@ void abFree(struct abuf *ab) { free(ab->b); }
 /*** output ***/
 
 void editorScroll() {
+  E.rx = 0;
+
+  if (E.cy < E.numrows) {
+    E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+  }
+
   if (E.cy < E.rowoff) {
     E.rowoff = E.cy;
   }
   if (E.cy >= E.rowoff + E.screenrows) {
     E.rowoff = E.cy - E.screenrows + 1;
   }
-  if (E.cx < E.coloff) {
-    E.coloff = E.cx;
+  if (E.rx < E.coloff) {
+    E.coloff = E.rx;
   }
-  if (E.cx >= E.coloff + E.screencols) {
-    E.coloff = E.cx - E.screencols + 1;
+  if (E.rx >= E.coloff + E.screencols) {
+    E.coloff = E.rx - E.screencols + 1;
   }
 }
 
@@ -309,20 +388,54 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
-      int len = E.row[filerow].size - E.coloff;
+      int len = E.row[filerow].rsize - E.coloff;
       if (len < 0)
         len = 0;
       if (len > E.screencols)
         len = E.screencols;
-      abAppend(ab, &E.row[filerow].chars[E.coloff], len);
+      abAppend(ab, &E.row[filerow].render[E.coloff], len);
     }
 
-    abAppend(
-        ab, "\x1b[K",
-        3); // Erase In Line: https://vt100.net/docs/vt100-ug/chapter3.html#EL
-    if (y < E.screenrows - 1) {
-      abAppend(ab, "\r\n", 2);
+    // Erase In Line: https://vt100.net/docs/vt100-ug/chapter3.html#EL
+    abAppend(ab, "\x1b[K", 3);
+    abAppend(ab, "\r\n", 2);
+  }
+}
+
+void editorDrawStatusBar(struct abuf *ab) {
+  // https://vt100.net/docs/vt100-ug/chapter3.html#SGR
+  abAppend(ab, "\x1b[7m", 4); // invert color
+
+  char status[80], rstatus[80];
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+                     E.filename ? E.filename : "[No Name]", E.numrows);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
+  if (len > E.screencols) {
+    len = E.screencols;
+  }
+  abAppend(ab, status, len);
+
+  while (len < E.screencols) {
+    if (E.screencols - len == rlen) {
+      abAppend(ab, rstatus, rlen);
+      break;
+    } else {
+      abAppend(ab, " ", 1);
+      len++;
     }
+  }
+  abAppend(ab, "\x1b[m", 3); // normal color
+  abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab) {
+  abAppend(ab, "\x1b[K", 3); // clear message bar
+  int msglen = strlen(E.statusmsg);
+  if (msglen > E.screencols) {
+    msglen = E.screencols;
+  }
+  if (msglen && time(NULL) - E.statusmsg_time < 5) {
+    abAppend(ab, E.statusmsg, msglen);
   }
 }
 
@@ -338,10 +451,12 @@ void editorRefreshScreen() {
   abAppend(&ab, "\x1b[H", 3); // CUP – Cursor Position
 
   editorDrawRows(&ab);
+  editorDrawStatusBar(&ab);
+  editorDrawMessageBar(&ab);
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-           (E.cx - E.coloff) + 1); // exact cursor position
+           (E.rx - E.coloff) + 1); // exact cursor position
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h",
@@ -349,6 +464,15 @@ void editorRefreshScreen() {
 
   write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
+}
+
+void editorSetStatusMessage(const char *fmt, ...) {
+  // https://en.wikipedia.org/wiki/Variadic_function
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+  va_end(ap);
+  E.statusmsg_time = time(NULL);
 }
 
 /*** input ***/
@@ -406,11 +530,21 @@ void editorProcessKeypress() {
     E.cx = 0;
     break;
   case END_KEY:
-    E.cx = E.screencols - 1;
+    if (E.cy < E.numrows) {
+      E.cx = E.row[E.cy].size;
+    }
     break;
 
   case PAGE_UP:
   case PAGE_DOWN: {
+    if (c == PAGE_UP) {
+      E.cy = E.rowoff;
+    } else if (c == PAGE_DOWN) {
+      E.cy = E.rowoff + E.screenrows - 1;
+      if (E.cy > E.numrows) {
+        E.cy = E.numrows;
+      }
+    }
     int times = E.screenrows;
     while (times--)
       editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -431,13 +565,19 @@ void editorProcessKeypress() {
 void initEditor() {
   E.cx = 0;
   E.cy = 0;
-  E.rowoff = 0;
+  E.rx = 0;
+  E.rowoff = 0; // default: scrolled to the top of the file
   E.coloff = 0;
   E.numrows = 0;
   E.row = NULL;
+  E.filename = NULL;
+  E.statusmsg[0] = '\0';
+  E.statusmsg_time = 0;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
+
+  E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[]) {
@@ -446,6 +586,8 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     editorOpen(argv[1]);
   }
+
+  editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
   while (1) {
     editorRefreshScreen();
