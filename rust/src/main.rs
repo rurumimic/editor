@@ -1,10 +1,13 @@
 #![allow(dead_code, unused)]
 
 use std::cmp;
+use std::env;
 use std::error;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::str;
+use std::time::{Duration, SystemTime};
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
@@ -12,6 +15,7 @@ use nix::sys::ioctl::*;
 use termios::*;
 
 const EDITOR_VERSION: &'static str = "0.0.1";
+const EDITOR_TAB_STOP: u16 = 8;
 
 macro_rules! ctrl_key {
     ($k:expr) => {
@@ -44,11 +48,27 @@ impl Drop for RawMode {
 }
 
 #[derive(Debug)]
+struct Erow {
+    size: usize,
+    rsize: usize,
+    chars: String,
+    render: String,
+}
+
+#[derive(Debug)]
 struct EditorConfig {
     cx: u16,
     cy: u16,
+    rx: u16,
+    rowoff: u16,
+    coloff: u16,
     screenrows: u16,
     screencols: u16,
+    numrows: u16,
+    row: Vec<Erow>,
+    filename: String,
+    statusmsg: String,
+    statusmsg_time: SystemTime,
     orig_termios: RawMode,
 }
 
@@ -94,8 +114,16 @@ fn enable_raw_mode() -> EditorConfig {
     EditorConfig {
         cx: 0,
         cy: 0,
+        rx: 0,
+        rowoff: 0,
+        coloff: 0,
         screenrows: 0,
         screencols: 0,
+        numrows: 0,
+        row: vec![],
+        filename: String::new(),
+        statusmsg: String::new(),
+        statusmsg_time: SystemTime::now(),
         orig_termios: RawMode(orig_termios),
     }
 }
@@ -209,6 +237,82 @@ fn get_window_size() -> Option<(u16, u16)> {
     Some((ws.ws_row, ws.ws_col))
 }
 
+fn editor_row_cx_to_rx(row: &Erow, cx: u16) -> u16 {
+    let mut rx: u16 = 0;
+    let data: Vec<char> = row.chars.chars().collect();
+    for j in 0..cx as usize {
+        if data[j] == '\t' {
+            rx += (EDITOR_TAB_STOP - 1) - (rx % EDITOR_TAB_STOP);
+        }
+        rx += 1;
+    }
+    rx
+}
+
+fn editor_update_row(row: &mut Erow) {
+    let mut tabs = 0;
+
+    let data: Vec<char> = row.chars.chars().collect();
+    for j in 0..row.size {
+        if data[j] == '\t' {
+            tabs += 1;
+        }
+    }
+
+    let mut idx = 0;
+    let mut rendered = String::new();
+    for j in 0..row.size {
+        if data[j] == '\t' {
+            rendered.push(' ');
+            while idx % EDITOR_TAB_STOP != 0 {
+                rendered.push(' ');
+            }
+        } else {
+            rendered.push(data[j]);
+        }
+    }
+
+    row.render = row.chars.clone();
+    row.rsize = row.size;
+}
+
+fn editor_append_row(conf: &mut EditorConfig, s: &str) {
+    let mut row = Erow {
+        size: s.len(),
+        chars: String::from(s),
+        rsize: 0,
+        render: String::new(),
+    };
+    editor_update_row(&mut row);
+    conf.row.push(row);
+    conf.numrows += 1;
+}
+
+fn editor_open(conf: &mut EditorConfig, filename: &str) {
+    conf.filename = String::from(filename);
+
+    let f = File::open(filename).expect("Can't open a file");
+    let mut reader = io::BufReader::new(f);
+    let mut line = String::new();
+
+    loop {
+        let mut linelen = reader.read_line(&mut line).expect("Can't read a line");
+        if linelen == 0 {
+            return;
+        }
+
+        let mut data: Vec<char> = line.chars().collect();
+
+        while linelen > 0 && (data[linelen - 1] == '\n' || data[linelen - 1] == '\r') {
+            linelen -= 1;
+        }
+
+        editor_append_row(conf, &line[..linelen]);
+
+        line.clear();
+    }
+}
+
 struct Abuf {
     b: String,
 }
@@ -223,41 +327,123 @@ impl Abuf {
     }
 }
 
-fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
-    for y in 0..conf.screenrows {
-        if y == conf.screenrows / 3 {
-            let welcome = format!("The Editor -- version {}", EDITOR_VERSION);
-            let welcomelen = cmp::min(welcome.len(), conf.screencols.into());
-            let mut padding = (conf.screencols - welcomelen as u16) / 2;
-            if padding > 0 {
-                ab.append("~");
-                padding -= 1;
-            }
-            while padding > 0 {
-                ab.append(" ");
-                padding -= 1;
-            }
-            ab.append(&welcome[..welcomelen]);
-        } else {
-            ab.append("~");
-        }
+fn editor_scroll(conf: &mut EditorConfig) {
+    conf.rx = 0;
+    if conf.cy < conf.numrows {
+        conf.rx = editor_row_cx_to_rx(&conf.row[conf.cy as usize], conf.cx);
+    }
 
-        ab.append("\x1b[K");
-        if y < conf.screenrows - 1 {
-            ab.append("\r\n");
-        }
+    if conf.cy < conf.rowoff {
+        conf.rowoff = conf.cy;
+    }
+    if conf.cy >= conf.rowoff + conf.screenrows {
+        conf.rowoff = conf.cy - conf.screenrows + 1;
+    }
+    if conf.rx < conf.coloff {
+        conf.coloff = conf.rx;
+    }
+    if conf.rx >= conf.coloff + conf.screencols {
+        conf.coloff = conf.rx - conf.screencols + 1;
     }
 }
 
-fn editor_refresh_screen(conf: &EditorConfig) {
+fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
+    for y in 0..conf.screenrows {
+        let filerow = y + conf.rowoff;
+        if filerow >= conf.numrows {
+            if conf.numrows == 0 && y == conf.screenrows / 3 {
+                let welcome = format!("The Editor -- version {}", EDITOR_VERSION);
+                let welcomelen = cmp::min(welcome.len(), conf.screencols.into());
+                let mut padding = (conf.screencols - welcomelen as u16) / 2;
+                if padding > 0 {
+                    ab.append("~");
+                    padding -= 1;
+                }
+                while padding > 0 {
+                    ab.append(" ");
+                    padding -= 1;
+                }
+                ab.append(&welcome[..welcomelen]);
+            } else {
+                ab.append("~");
+            }
+        } else {
+            let mut len = conf.row[filerow as usize].rsize as i16 - conf.coloff as i16;
+
+            if len > 0 {
+                if len > conf.screencols as i16 {
+                    len = conf.screencols as i16;
+                }
+                len += conf.coloff as i16;
+                ab.append(&conf.row[filerow as usize].render[conf.coloff as usize..len as usize]);
+            }
+        }
+
+        ab.append("\x1b[K");
+        ab.append("\r\n");
+    }
+}
+
+fn editor_draw_status_bar(conf: &EditorConfig, ab: &mut Abuf) {
+    ab.append("\x1b[7m");
+
+    let filename = match conf.filename.is_empty() {
+        true => "[No Name]",
+        false => &conf.filename,
+    };
+
+    let status = format!("{} - {} lines", &filename, conf.numrows);
+    let rstatus = format!("{}/{}", conf.cy + 1, conf.numrows);
+
+    let mut len = status.len() as u16;
+    let rlen = rstatus.len() as u16;
+    if len > conf.screencols {
+        len = conf.screencols;
+    }
+    ab.append(&status[..len as usize]);
+
+    while len < conf.screencols {
+        if conf.screencols - len == rlen {
+            ab.append(&rstatus);
+            break;
+        } else {
+            ab.append(" ");
+            len += 1;
+        }
+    }
+
+    ab.append("\x1b[m");
+    ab.append("\r\n");
+}
+
+fn editor_draw_message_bar(conf: &EditorConfig, ab: &mut Abuf) {
+    ab.append("\x1b[K");
+    let mut msglen = conf.statusmsg.len();
+    if msglen > conf.screencols as usize {
+        msglen = conf.screencols as usize;
+    }
+    if msglen > 0 && SystemTime::now().duration_since(conf.statusmsg_time).unwrap() < Duration::new(5, 0) {
+        ab.append(&conf.statusmsg);
+    }
+}
+
+fn editor_refresh_screen(conf: &mut EditorConfig) {
+    editor_scroll(conf);
+
     let mut ab = Abuf::new();
 
     ab.append("\x1b[?25l");
     ab.append("\x1b[H");
 
-    editor_draw_rows(&conf, &mut ab);
+    editor_draw_rows(conf, &mut ab);
+    editor_draw_status_bar(conf, &mut ab);
+    editor_draw_message_bar(conf, &mut ab);
 
-    let cursor = format!("\x1b[{};{}H", conf.cy + 1, conf.cx + 1);
+    let cursor = format!(
+        "\x1b[{};{}H",
+        (conf.cy - conf.rowoff) + 1,
+        (conf.rx - conf.coloff) + 1
+    );
     ab.append(cursor.as_str());
 
     ab.append("\x1b[?25h");
@@ -266,7 +452,16 @@ fn editor_refresh_screen(conf: &EditorConfig) {
     _ = io::stdout().flush();
 }
 
+fn editor_set_status_message(conf: &mut EditorConfig, fmt: &str) {
+    conf.statusmsg = fmt.to_string();
+}
+
 fn editor_move_cursor(key: EditorKey, conf: &mut EditorConfig) {
+    let mut size: Option<usize> = None;
+    if conf.cy < conf.numrows {
+        size = Some(conf.row[conf.cy as usize].size);
+    }
+
     match key {
         EditorKey::ArrowUp => {
             if conf.cy != 0 {
@@ -274,21 +469,35 @@ fn editor_move_cursor(key: EditorKey, conf: &mut EditorConfig) {
             }
         }
         EditorKey::ArrowDown => {
-            if conf.cy != conf.screenrows - 1 {
+            if conf.cy < conf.numrows {
                 conf.cy += 1;
             }
         }
         EditorKey::ArrowLeft => {
             if conf.cx != 0 {
                 conf.cx -= 1;
+            } else if conf.cy > 0 {
+                conf.cy -= 1;
+                conf.cx = conf.row[conf.cy as usize].size as u16;
             }
         }
         EditorKey::ArrowRight => {
-            if conf.cx != conf.screencols - 1 {
-                conf.cx += 1;
+            if let Some(s) = size {
+                if conf.cx < s as u16 {
+                    conf.cx += 1;
+                } else if conf.cx == s as u16 {
+                    conf.cy += 1;
+                    conf.cx = 0;
+                }
             }
         }
         _ => {}
+    }
+
+    if conf.cy < conf.numrows {
+        if conf.cx > conf.row[conf.cy as usize].size as u16 {
+            conf.cx = conf.row[conf.cy as usize].size as u16;
+        }
     }
 }
 
@@ -305,8 +514,21 @@ fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
 
     match c {
         EditorKey::HomeKey => conf.cx = 0,
-        EditorKey::EndKey => conf.cx = conf.screencols - 1,
+        EditorKey::EndKey => if conf.cy < conf.numrows {
+            conf.cx = conf.row[conf.cy as usize].size as u16;
+        },
         EditorKey::PageUp | EditorKey::PageDown => {
+            match c {
+                EditorKey::PageUp => conf.cy = conf.rowoff,
+                EditorKey::PageDown => {
+                    conf.cy = conf.rowoff + conf.screenrows - 1;
+                    if conf.cy > conf.numrows {
+                        conf.cy = conf.numrows;
+                    }
+                }
+                _ => {}
+            }
+
             let mut times = conf.screenrows;
             while times > 0 {
                 times -= 1;
@@ -331,9 +553,7 @@ fn init_editor(conf: &mut EditorConfig) -> bool {
         return false;
     };
 
-    conf.cx = 0;
-    conf.cy = 0;
-    conf.screenrows = row;
+    conf.screenrows = row - 2;
     conf.screencols = col;
     true
 }
@@ -344,8 +564,15 @@ fn main() {
         return;
     }
 
+    let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 {
+        editor_open(&mut conf, &args[1]);
+    }
+
+    editor_set_status_message(&mut conf, "HELP: Ctrl-Q = quit");
+
     loop {
-        editor_refresh_screen(&conf);
+        editor_refresh_screen(&mut conf);
         if editor_process_keypress(&mut conf) == false {
             break;
         }
