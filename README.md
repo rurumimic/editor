@@ -4,11 +4,11 @@
 
 | lang | file | progress |
 |---|---|---|
-| C | [kilo.c](c/kilo.c) | [■■■   ] |
-| C++ | [main.cpp](cpp/main.cpp) | [■     ] |
-| Go | [main.go](go/main.go) | [■■    ] |
-| Rust | [main.rs](rust/src/main.rs) | [■■■   ] |
-| Zig | [main.zig](zig/src/main.zig) | [■     ] |
+| C | [kilo.c](c/kilo.c) | 🌊🌊🚣 |
+| C++ | [main.cpp](cpp/main.cpp) | 🚣 |
+| Go | [main.go](go/main.go) | 🌊🚣 |
+| Rust | [main.rs](rust/src/main.rs) | 🌊🌊🚣 |
+| Zig | [main.zig](zig/src/main.zig) | 🚣 |
 
 ## Build and Run
 
