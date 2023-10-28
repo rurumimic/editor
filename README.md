@@ -4,7 +4,7 @@
 
 | lang | file | progress |
 |---|---|---|
-| C | [kilo.c](c/kilo.c) | ███▒▒▒ |
+| C | [kilo.c](c/kilo.c) | ████▒▒ |
 | C++ | [main.cpp](cpp/main.cpp) | █▒▒▒▒▒ |
 | Go | [main.go](go/main.go) | ██▒▒▒▒ |
 | Rust | [main.rs](rust/src/main.rs) | ███▒▒▒ |
