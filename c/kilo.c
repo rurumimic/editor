@@ -68,7 +68,7 @@ struct editorConfig E;
 /*** prototypes ***/
 
 void editorSetStatusMessage(const char *fmt, ...);
-void editorRefreshScreen();
+void editorRefreshScreen(void);
 char *editorPrompt(char *prompt);
 
 /*** terminal ***/
@@ -81,12 +81,12 @@ void die(const char *s) {
   exit(1);
 }
 
-void disableRawMode() {
+void disableRawMode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
     die("tcsetattr");
 }
 
-void enableRawMode() {
+void enableRawMode(void) {
   // read the current terminal's attributes
   if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
     die("tcgetattr");
@@ -122,7 +122,7 @@ void enableRawMode() {
     die("tcsetattr"); // write the terminal's attributes
 }
 
-int editorReadKey() {
+int editorReadKey(void) {
   int nread;
   char c;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -351,7 +351,7 @@ void editorInsertChar(int c) {
   E.cx++;
 }
 
-void editorInsertNewline() {
+void editorInsertNewline(void) {
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -375,7 +375,7 @@ void editorRowAppendString(erow *row, char *s, size_t len) {
   E.dirty++;
 }
 
-void editorDelChar() {
+void editorDelChar(void) {
   if (E.cy == E.numrows) { // end of the file
     return;
   }
@@ -446,7 +446,7 @@ void editorOpen(char *filename) {
   E.dirty = 0;
 }
 
-void editorSave() {
+void editorSave(void) {
   if (E.filename == NULL) {
     E.filename = editorPrompt("Save as: %s (ESC to cancel)");
     if (E.filename == NULL) {
@@ -502,7 +502,7 @@ void abFree(struct abuf *ab) { free(ab->b); }
 
 /*** output ***/
 
-void editorScroll() {
+void editorScroll(void) {
   E.rx = 0;
 
   if (E.cy < E.numrows) {
@@ -599,7 +599,7 @@ void editorDrawMessageBar(struct abuf *ab) {
   }
 }
 
-void editorRefreshScreen() {
+void editorRefreshScreen(void) {
   editorScroll();
 
   struct abuf ab = ABUF_INIT;
@@ -712,7 +712,7 @@ void editorMoveCursor(int key) {
   }
 }
 
-void editorProcessKeypress() {
+void editorProcessKeypress(void) {
   static int quit_times = KILO_QUIT_TIMES;
 
   int c = editorReadKey();
@@ -794,7 +794,7 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-void initEditor() {
+void initEditor(void) {
   E.cx = 0;
   E.cy = 0;
   E.rx = 0;

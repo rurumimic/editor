@@ -3,7 +3,7 @@
 use std::cmp;
 use std::env;
 use std::error;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::str;
@@ -16,6 +16,7 @@ use termios::*;
 
 const EDITOR_VERSION: &'static str = "0.0.1";
 const EDITOR_TAB_STOP: u16 = 8;
+const EDITOR_QUIT_TIMES: u16 = 3;
 
 macro_rules! ctrl_key {
     ($k:expr) => {
@@ -26,6 +27,8 @@ macro_rules! ctrl_key {
 #[repr(u8)]
 enum EditorKey {
     Key(u8),
+    Backspace = 127,
+    Enter = b'\r',
     Esc = b'\x1b',
     ArrowLeft,
     ArrowRight,
@@ -66,10 +69,12 @@ struct EditorConfig {
     screencols: u16,
     numrows: u16,
     row: Vec<Erow>,
+    dirty: u16,
     filename: String,
     statusmsg: String,
     statusmsg_time: SystemTime,
     orig_termios: RawMode,
+    quit_times: u16,
 }
 
 fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
@@ -121,10 +126,12 @@ fn enable_raw_mode() -> EditorConfig {
         screencols: 0,
         numrows: 0,
         row: vec![],
+        dirty: 0,
         filename: String::new(),
         statusmsg: String::new(),
         statusmsg_time: SystemTime::now(),
         orig_termios: RawMode(orig_termios),
+        quit_times: 0,
     }
 }
 
@@ -194,6 +201,14 @@ fn editor_read_key() -> EditorKey {
         return EditorKey::Esc;
     }
 
+    if c[0] == b'\r' {
+        return EditorKey::Enter;
+    }
+
+    if c[0] == 127 {
+        return EditorKey::Backspace;
+    }
+
     EditorKey::Key(c[0])
 }
 
@@ -226,7 +241,7 @@ fn get_window_size() -> Option<(u16, u16)> {
     };
 
     unsafe {
-        if (ioctl(io::stdout().as_raw_fd(), TIOCGWINSZ, &mut ws) == -1 || ws.ws_col == 0) {
+        if ioctl(io::stdout().as_raw_fd(), TIOCGWINSZ, &mut ws) == -1 || ws.ws_col == 0 {
             if io::stdout().write(b"\x1b[999C\x1b[999B").is_err() {
                 return None;
             }
@@ -276,7 +291,11 @@ fn editor_update_row(row: &mut Erow) {
     row.rsize = row.size;
 }
 
-fn editor_append_row(conf: &mut EditorConfig, s: &str) {
+fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
+    if at > conf.numrows {
+        return;
+    }
+
     let mut row = Erow {
         size: s.len(),
         chars: String::from(s),
@@ -284,8 +303,112 @@ fn editor_append_row(conf: &mut EditorConfig, s: &str) {
         render: String::new(),
     };
     editor_update_row(&mut row);
-    conf.row.push(row);
+    conf.row.insert(at.into(), row);
     conf.numrows += 1;
+    conf.dirty += 1;
+}
+
+fn editor_del_row(conf: &mut EditorConfig, at: u16) {
+    if at >= conf.numrows {
+        return;
+    }
+    conf.row.remove(at.into());
+    conf.numrows -= 1;
+    conf.dirty += 1;
+}
+
+fn editor_row_insert_char(conf: &mut EditorConfig, at: u16, c: u8) {
+    let mut row: &mut Erow = &mut conf.row[at as usize];
+
+    let mut index: usize = conf.cx.into();
+    if conf.cx as usize > row.size {
+        index = row.size;
+    }
+
+    row.size += 1;
+    row.chars.insert(index, c as char);
+    editor_update_row(row);
+    conf.dirty += 1;
+}
+
+fn editor_row_append_string(conf: &mut EditorConfig, at: u16, s: &str) {
+    let mut row: &mut Erow = &mut conf.row[at as usize];
+
+    row.chars.push_str(s);
+    row.size += s.len();
+
+    editor_update_row(row);
+    conf.dirty += 1;
+}
+
+fn editor_row_del_char(conf: &mut EditorConfig, at: u16) {
+    let mut row: &mut Erow = &mut conf.row[at as usize];
+
+    if conf.cx as usize >= row.size {
+        return;
+    }
+
+    row.size -= 1;
+    row.chars.remove(conf.cx.into());
+    editor_update_row(row);
+    conf.dirty += 1;
+}
+
+fn editor_insert_char(conf: &mut EditorConfig, c: u8) {
+    if conf.cy == conf.numrows {
+        editor_insert_row(conf, conf.numrows, "");
+    }
+
+    editor_row_insert_char(conf, conf.cy, c);
+    conf.cx += 1;
+}
+
+fn editor_insert_newline(conf: &mut EditorConfig) {
+    if conf.cx == 0 {
+        editor_insert_row(conf, conf.cy, "");
+    } else {
+        let cx = conf.cx;
+        let cy = conf.cy;
+
+        let s = conf.row[cy as usize].chars.clone();
+        editor_insert_row(conf, cy + 1, &s[cx as usize..]);
+
+        let mut row = &mut conf.row[cy as usize];
+        row.chars = row.chars[..cx as usize].to_string();
+        // row.chars = String::from("xxxxx");
+        row.size = cx as usize;
+        editor_update_row(&mut row);
+    }
+    conf.cy += 1;
+    conf.cx = 0;
+}
+
+fn editor_del_char(conf: &mut EditorConfig) {
+    if conf.cy == conf.numrows {
+        return;
+    }
+
+    if conf.cx == 0 && conf.cy == 0 {
+        return;
+    }
+
+    if conf.cx > 0 {
+        conf.cx -= 1;
+        editor_row_del_char(conf, conf.cy);
+    } else {
+        conf.cx = conf.row[conf.cy as usize - 1].size as u16;
+        editor_row_append_string(conf, conf.cy - 1, &conf.row[conf.cy as usize].chars.clone());
+        editor_del_row(conf, conf.cy);
+        conf.cy -= 1;
+    }
+}
+
+fn editor_rows_to_string(conf: &EditorConfig) -> String {
+    conf.row
+        .iter()
+        .map(|erow| erow.chars.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n")
 }
 
 fn editor_open(conf: &mut EditorConfig, filename: &str) {
@@ -298,7 +421,7 @@ fn editor_open(conf: &mut EditorConfig, filename: &str) {
     loop {
         let mut linelen = reader.read_line(&mut line).expect("Can't read a line");
         if linelen == 0 {
-            return;
+            break;
         }
 
         let mut data: Vec<char> = line.chars().collect();
@@ -307,10 +430,45 @@ fn editor_open(conf: &mut EditorConfig, filename: &str) {
             linelen -= 1;
         }
 
-        editor_append_row(conf, &line[..linelen]);
+        editor_insert_row(conf, conf.numrows, &line[..linelen]);
 
         line.clear();
     }
+
+    conf.dirty = 0;
+}
+
+fn editor_save(conf: &mut EditorConfig) {
+    if conf.filename.is_empty() {
+        if let Some(filename) = editor_prompt(conf, "Save as: {} (ESC to cancel)") {
+            conf.filename = filename;
+        } else {
+            editor_set_status_message(conf, "Save aborted");
+            return;
+        }
+    }
+
+    let buf = editor_rows_to_string(conf);
+
+    let result = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(&conf.filename);
+
+    let mut message = match result {
+        Ok(mut f) => match f.write_all(buf.as_bytes()) {
+            Ok(_) => {
+                conf.dirty = 0;
+                format!("{} bytes written to disk", buf.len())
+            }
+            Err(e) => format!("Can't save! I/O error: {}", e.to_string()),
+        },
+        Err(e) => format!("Can't save! I/O error: {}", e.to_string()),
+    };
+
+    editor_set_status_message(conf, &message);
 }
 
 struct Abuf {
@@ -392,7 +550,12 @@ fn editor_draw_status_bar(conf: &EditorConfig, ab: &mut Abuf) {
         false => &conf.filename,
     };
 
-    let status = format!("{} - {} lines", &filename, conf.numrows);
+    let modified = match conf.dirty > 0 {
+        true => "(modified)",
+        false => "",
+    };
+
+    let status = format!("{} - {} lines {}", &filename, conf.numrows, modified);
     let rstatus = format!("{}/{}", conf.cy + 1, conf.numrows);
 
     let mut len = status.len() as u16;
@@ -422,7 +585,12 @@ fn editor_draw_message_bar(conf: &EditorConfig, ab: &mut Abuf) {
     if msglen > conf.screencols as usize {
         msglen = conf.screencols as usize;
     }
-    if msglen > 0 && SystemTime::now().duration_since(conf.statusmsg_time).unwrap() < Duration::new(5, 0) {
+    if msglen > 0
+        && SystemTime::now()
+            .duration_since(conf.statusmsg_time)
+            .unwrap()
+            < Duration::new(5, 0)
+    {
         ab.append(&conf.statusmsg);
     }
 }
@@ -454,9 +622,49 @@ fn editor_refresh_screen(conf: &mut EditorConfig) {
 
 fn editor_set_status_message(conf: &mut EditorConfig, fmt: &str) {
     conf.statusmsg = fmt.to_string();
+    conf.statusmsg_time = SystemTime::now();
 }
 
-fn editor_move_cursor(key: EditorKey, conf: &mut EditorConfig) {
+fn editor_prompt(conf: &mut EditorConfig, prompt: &str) -> Option<String> {
+    let mut buf = String::new();
+
+    loop {
+        editor_set_status_message(
+            conf,
+            String::from(prompt).replace("{}", buf.as_str()).as_str(),
+        );
+        editor_refresh_screen(conf);
+
+        let c = editor_read_key();
+        match c {
+            EditorKey::Backspace | EditorKey::DelKey => {
+                if !buf.is_empty() {
+                    buf.pop();
+                }
+            }
+            EditorKey::Esc => {
+                editor_set_status_message(conf, "");
+                return None;
+            }
+            EditorKey::Enter => {
+                if !buf.is_empty() {
+                    editor_set_status_message(conf, "");
+                    return Some(buf);
+                }
+            }
+            EditorKey::Key(key) => {
+                if !buf.is_empty() && key == ctrl_key!(b'h') {
+                    buf.pop();
+                } else if !key.is_ascii_control() && key < 128 {
+                    buf.push(key as char);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn editor_move_cursor(conf: &mut EditorConfig, key: EditorKey) {
     let mut size: Option<usize> = None;
     if conf.cy < conf.numrows {
         size = Some(conf.row[conf.cy as usize].size);
@@ -504,19 +712,45 @@ fn editor_move_cursor(key: EditorKey, conf: &mut EditorConfig) {
 fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
     let c = editor_read_key();
 
-    if let EditorKey::Key(key) = c {
-        if key == ctrl_key!(b'q') {
-            _ = io::stdout().write(b"\x1b[2J");
-            _ = io::stdout().write(b"\x1b[H");
-            return false;
-        }
-    }
-
     match c {
+        EditorKey::Key(key) => {
+            if key == ctrl_key!(b'q') {
+                if conf.dirty > 0 && conf.quit_times > 0 {
+                    let message = format!(
+                        "WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                        conf.quit_times
+                    );
+                    editor_set_status_message(conf, &message);
+                    conf.quit_times -= 1;
+                    return true;
+                }
+                _ = io::stdout().write(b"\x1b[2J");
+                _ = io::stdout().write(b"\x1b[H");
+                return false;
+            } else if key == ctrl_key!(b'h') {
+                // backspace
+                editor_del_char(conf);
+            } else if key == ctrl_key!(b'l') { // escape
+                 // pass
+            } else if key == ctrl_key!(b's') {
+                editor_save(conf);
+            } else {
+                editor_insert_char(conf, key);
+            }
+        }
         EditorKey::HomeKey => conf.cx = 0,
-        EditorKey::EndKey => if conf.cy < conf.numrows {
-            conf.cx = conf.row[conf.cy as usize].size as u16;
-        },
+        EditorKey::EndKey => {
+            if conf.cy < conf.numrows {
+                conf.cx = conf.row[conf.cy as usize].size as u16;
+            }
+        }
+        EditorKey::Backspace => {
+            editor_del_char(conf);
+        }
+        EditorKey::DelKey => {
+            editor_move_cursor(conf, EditorKey::ArrowRight);
+            editor_del_char(conf);
+        }
         EditorKey::PageUp | EditorKey::PageDown => {
             match c {
                 EditorKey::PageUp => conf.cy = conf.rowoff,
@@ -533,17 +767,20 @@ fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
             while times > 0 {
                 times -= 1;
                 match c {
-                    EditorKey::PageUp => editor_move_cursor(EditorKey::ArrowUp, conf),
-                    _ => editor_move_cursor(EditorKey::ArrowDown, conf),
+                    EditorKey::PageUp => editor_move_cursor(conf, EditorKey::ArrowUp),
+                    _ => editor_move_cursor(conf, EditorKey::ArrowDown),
                 }
             }
         }
         EditorKey::ArrowUp
         | EditorKey::ArrowDown
         | EditorKey::ArrowLeft
-        | EditorKey::ArrowRight => editor_move_cursor(c, conf),
-        _ => {}
+        | EditorKey::ArrowRight => editor_move_cursor(conf, c),
+        EditorKey::Enter => editor_insert_newline(conf),
+        EditorKey::Esc => {}
     }
+
+    conf.quit_times = EDITOR_QUIT_TIMES;
 
     true
 }
@@ -569,7 +806,7 @@ fn main() {
         editor_open(&mut conf, &args[1]);
     }
 
-    editor_set_status_message(&mut conf, "HELP: Ctrl-Q = quit");
+    editor_set_status_message(&mut conf, "HELP: Ctrl-S = save | Ctrl-Q = quit");
 
     loop {
         editor_refresh_screen(&mut conf);
