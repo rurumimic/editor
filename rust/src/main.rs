@@ -75,6 +75,8 @@ struct EditorConfig {
     statusmsg_time: SystemTime,
     orig_termios: RawMode,
     quit_times: u16,
+    last_match: i16,
+    direction: i16,
 }
 
 fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
@@ -132,6 +134,8 @@ fn enable_raw_mode() -> EditorConfig {
         statusmsg_time: SystemTime::now(),
         orig_termios: RawMode(orig_termios),
         quit_times: 0,
+        last_match: -1,
+        direction: 1,
     }
 }
 
@@ -264,6 +268,26 @@ fn editor_row_cx_to_rx(row: &Erow, cx: u16) -> u16 {
     rx
 }
 
+fn editor_row_rx_to_cx(row: &Erow, rx: u16) -> u16 {
+    let mut cur_rx: u16 = 0;
+    let mut cx = row.size as u16;
+
+    let data: Vec<char> = row.chars.chars().collect();
+    for i in 0..row.size as u16 {
+        cx = i;
+
+        if data[cx as usize] == '\t' {
+            cur_rx += (EDITOR_TAB_STOP - 1) - (cur_rx % EDITOR_TAB_STOP);
+        }
+        cur_rx += 1;
+
+        if cur_rx > rx {
+            return cx;
+        }
+    }
+    cx
+}
+
 fn editor_update_row(row: &mut Erow) {
     let mut tabs = 0;
 
@@ -375,7 +399,6 @@ fn editor_insert_newline(conf: &mut EditorConfig) {
 
         let mut row = &mut conf.row[cy as usize];
         row.chars = row.chars[..cx as usize].to_string();
-        // row.chars = String::from("xxxxx");
         row.size = cx as usize;
         editor_update_row(&mut row);
     }
@@ -440,7 +463,7 @@ fn editor_open(conf: &mut EditorConfig, filename: &str) {
 
 fn editor_save(conf: &mut EditorConfig) {
     if conf.filename.is_empty() {
-        if let Some(filename) = editor_prompt(conf, "Save as: {} (ESC to cancel)") {
+        if let Some(filename) = editor_prompt(conf, "Save as: {} (ESC to cancel)", None) {
             conf.filename = filename;
         } else {
             editor_set_status_message(conf, "Save aborted");
@@ -457,18 +480,73 @@ fn editor_save(conf: &mut EditorConfig) {
         .create(true)
         .open(&conf.filename);
 
-    let mut message = match result {
+    let (reset_dirty, message) = match result {
         Ok(mut f) => match f.write_all(buf.as_bytes()) {
-            Ok(_) => {
-                conf.dirty = 0;
-                format!("{} bytes written to disk", buf.len())
-            }
-            Err(e) => format!("Can't save! I/O error: {}", e.to_string()),
+            Ok(_) => (true, format!("{} bytes written to disk", buf.len())),
+            Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
         },
-        Err(e) => format!("Can't save! I/O error: {}", e.to_string()),
+        Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
     };
 
+    if reset_dirty {
+        conf.dirty = 0;
+    }
+
     editor_set_status_message(conf, &message);
+}
+
+fn editor_find_callback(conf: &mut EditorConfig, query: &str, c: EditorKey) {
+    if matches!(c, EditorKey::Enter | EditorKey::Esc) {
+        conf.last_match = -1;
+        conf.direction = 1;
+        return;
+    } else if matches!(c, EditorKey::ArrowRight | EditorKey::ArrowDown) {
+        conf.direction = 1;
+    } else if matches!(c, EditorKey::ArrowLeft | EditorKey::ArrowUp) {
+        conf.direction = -1;
+    } else {
+        conf.last_match = -1;
+        conf.direction = 1;
+    }
+
+    if conf.last_match == -1 {
+        conf.direction = 1;
+    }
+    let mut current = conf.last_match;
+
+    for i in 0..conf.numrows {
+        current += conf.direction;
+        if current == -1 {
+            current = conf.numrows as i16 - 1;
+        } else if current == conf.numrows as i16 {
+            current = 0;
+        }
+
+        let row = &conf.row[current as usize];
+        if let Some(index) = row.render.find(&query) {
+            conf.last_match = current;
+            conf.cy = current as u16;
+            conf.cx = editor_row_rx_to_cx(row, index as u16);
+            conf.rowoff = conf.numrows;
+            break;
+        }
+    }
+}
+
+fn editor_find(conf: &mut EditorConfig) {
+    let saved_cx = conf.cx;
+    let saved_cy = conf.cy;
+    let saved_coloff = conf.coloff;
+    let saved_rowoff = conf.rowoff;
+
+    let query = editor_prompt(conf, "Search: {} (Use ESC/Arrows/Enter)", Some(editor_find_callback));
+
+    if query.is_none() {
+        conf.cx = saved_cx;
+        conf.cy = saved_cy;
+        conf.coloff = saved_coloff;
+        conf.rowoff = saved_rowoff;
+    }
 }
 
 struct Abuf {
@@ -625,7 +703,11 @@ fn editor_set_status_message(conf: &mut EditorConfig, fmt: &str) {
     conf.statusmsg_time = SystemTime::now();
 }
 
-fn editor_prompt(conf: &mut EditorConfig, prompt: &str) -> Option<String> {
+fn editor_prompt(
+    conf: &mut EditorConfig,
+    prompt: &str,
+    callback: Option<fn(&mut EditorConfig, &str, EditorKey)>,
+) -> Option<String> {
     let mut buf = String::new();
 
     loop {
@@ -644,11 +726,13 @@ fn editor_prompt(conf: &mut EditorConfig, prompt: &str) -> Option<String> {
             }
             EditorKey::Esc => {
                 editor_set_status_message(conf, "");
+                callback.as_ref().map(|cb| cb(conf, &buf, c));
                 return None;
             }
             EditorKey::Enter => {
                 if !buf.is_empty() {
                     editor_set_status_message(conf, "");
+                    callback.as_ref().map(|cb| cb(conf, &buf, c));
                     return Some(buf);
                 }
             }
@@ -661,6 +745,8 @@ fn editor_prompt(conf: &mut EditorConfig, prompt: &str) -> Option<String> {
             }
             _ => {}
         }
+
+        callback.as_ref().map(|cb| cb(conf, &buf, c));
     }
 }
 
@@ -734,6 +820,8 @@ fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
                  // pass
             } else if key == ctrl_key!(b's') {
                 editor_save(conf);
+            } else if key == ctrl_key!(b'f') {
+                editor_find(conf);
             } else {
                 editor_insert_char(conf, key);
             }
@@ -806,7 +894,10 @@ fn main() {
         editor_open(&mut conf, &args[1]);
     }
 
-    editor_set_status_message(&mut conf, "HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editor_set_status_message(
+        &mut conf,
+        "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find",
+    );
 
     loop {
         editor_refresh_screen(&mut conf);
