@@ -606,12 +606,23 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
         } else {
             let mut len = conf.row[filerow as usize].rsize as i16 - conf.coloff as i16;
 
-            if len > 0 {
-                if len > conf.screencols as i16 {
-                    len = conf.screencols as i16;
+            if len < 0 {
+                len = 0;
+            }
+            if len > conf.screencols as i16 {
+                len = conf.screencols as i16;
+            }
+
+            for j in 0..len as u16 {
+                let index = (conf.coloff + j) as usize;
+                let c = &conf.row[filerow as usize].render[index..].chars().nth(0).unwrap();
+                if c.is_digit(10) {
+                    ab.append("\x1b[31m");
+                    ab.append(&c.to_string());
+                    ab.append("\x1b[39m");
+                } else {
+                    ab.append(&c.to_string());
                 }
-                len += conf.coloff as i16;
-                ab.append(&conf.row[filerow as usize].render[conf.coloff as usize..len as usize]);
             }
         }
 
