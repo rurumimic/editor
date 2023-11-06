@@ -1,8 +1,5 @@
-#![allow(dead_code, unused)]
-
 use std::cmp;
 use std::env;
-use std::error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -11,7 +8,6 @@ use std::time::{Duration, SystemTime};
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
-use nix::sys::ioctl::*;
 use termios::*;
 
 const EDITOR_VERSION: &'static str = "0.0.1";
@@ -41,6 +37,23 @@ enum EditorKey {
     PageDown,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum EditorHighlight {
+    HlNormal = 37,
+    HlNumber = 31,
+    HlMatch = 34,
+}
+
+const HL_HIGHLIGHT_NUMBERS: u32 = 1 << 0;
+
+#[derive(Debug, Clone, Copy)]
+struct EditorSyntax<'a> {
+    filetype: &'a str,
+    filematch: &'a [&'a str],
+    flags: u32,
+}
+
 #[derive(Debug)]
 struct RawMode(Termios);
 
@@ -56,10 +69,12 @@ struct Erow {
     rsize: usize,
     chars: String,
     render: String,
+    hl: Vec<EditorHighlight>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
-struct EditorConfig {
+struct EditorConfig<'a> {
     cx: u16,
     cy: u16,
     rx: u16,
@@ -73,12 +88,24 @@ struct EditorConfig {
     filename: String,
     statusmsg: String,
     statusmsg_time: SystemTime,
+    syntax: Option<EditorSyntax<'a>>,
     orig_termios: RawMode,
     quit_times: u16,
     last_match: i16,
     direction: i16,
+    saved_hl_line: i16,
+    saved_hl: Vec<EditorHighlight>,
 }
 
+static C_HL_EXTENSIONS: &[&str] = &[".c", ".h", ".cpp"];
+
+static HLDB: &[EditorSyntax] = &[EditorSyntax {
+    filetype: "c",
+    filematch: C_HL_EXTENSIONS,
+    flags: HL_HIGHLIGHT_NUMBERS,
+}];
+
+#[allow(unused)]
 fn unsafe_write(buf: &str) -> Result<isize, io::Error> {
     let ret = unsafe {
         libc::write(
@@ -105,7 +132,7 @@ fn disable_raw_mode(orig_termios: &mut RawMode) {
     tcsetattr(io::stdin().as_raw_fd(), TCSAFLUSH, &orig_termios.0).unwrap();
 }
 
-fn enable_raw_mode() -> EditorConfig {
+fn enable_raw_mode<'a>() -> EditorConfig<'a> {
     let orig_termios = Termios::from_fd(io::stdin().as_raw_fd()).unwrap();
     let mut raw = orig_termios;
 
@@ -132,10 +159,13 @@ fn enable_raw_mode() -> EditorConfig {
         filename: String::new(),
         statusmsg: String::new(),
         statusmsg_time: SystemTime::now(),
+        syntax: None,
         orig_termios: RawMode(orig_termios),
         quit_times: 0,
         last_match: -1,
         direction: 1,
+        saved_hl_line: 0,
+        saved_hl: vec![],
     }
 }
 
@@ -256,6 +286,84 @@ fn get_window_size() -> Option<(u16, u16)> {
     Some((ws.ws_row, ws.ws_col))
 }
 
+fn is_seprator(c: char) -> bool {
+    if c.is_whitespace() {
+        return true;
+    } else if c == '\0' {
+        return true;
+    }
+
+    match c {
+        ',' | '.' | '(' | ')' | '+' | '-' | '/' | '*' | '=' | '~' | '%' | '<' | '>' | '[' | ']'
+        | '"' => false,
+        _ => true,
+    }
+}
+
+#[allow(unused_assignments)]
+fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
+    row.hl = vec![EditorHighlight::HlNormal; row.rsize];
+    let data: Vec<char> = row.render.chars().collect();
+
+    let flags = match syntax {
+        Some(x) => x.flags,
+        None => return,
+    };
+
+    let mut prev_sep = true;
+    let mut i = 0;
+
+    while i < row.rsize {
+        let c = data[i];
+
+        let prev_hl = match i > 0 {
+            true => row.hl[i - 1],
+            false => EditorHighlight::HlNormal,
+        };
+
+        if flags & HL_HIGHLIGHT_NUMBERS > 0 {
+            if c.is_digit(10) && (prev_sep == true || matches!(prev_hl, EditorHighlight::HlNumber))
+                || (c == '.' && matches!(prev_hl, EditorHighlight::HlNumber))
+            {
+                row.hl[i] = EditorHighlight::HlNumber;
+                i += 1;
+                prev_sep = false;
+                continue;
+            }
+        }
+
+        prev_sep = is_seprator(c);
+        i += 1;
+    }
+}
+
+fn editor_select_syntax_highlight(conf: &mut EditorConfig) {
+    conf.syntax = None;
+    if conf.filename.is_empty() {
+        return;
+    }
+
+    let extension = conf
+        .filename
+        .rfind('.')
+        .map(|index| &conf.filename[index..]);
+
+    match extension {
+        Some(ext) => {
+            for entry in HLDB {
+                if entry.filematch.contains(&ext) {
+                    conf.syntax = Some(*entry);
+
+                    for filerow in 0..conf.numrows {
+                        editor_update_syntax(&mut conf.row[filerow as usize], &conf.syntax);
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+}
+
 fn editor_row_cx_to_rx(row: &Erow, cx: u16) -> u16 {
     let mut rx: u16 = 0;
     let data: Vec<char> = row.chars.chars().collect();
@@ -268,7 +376,7 @@ fn editor_row_cx_to_rx(row: &Erow, cx: u16) -> u16 {
     rx
 }
 
-fn editor_row_rx_to_cx(row: &Erow, rx: u16) -> u16 {
+fn editor_row_rx_to_cx(row: &mut Erow, rx: u16) -> u16 {
     let mut cur_rx: u16 = 0;
     let mut cx = row.size as u16;
 
@@ -288,13 +396,13 @@ fn editor_row_rx_to_cx(row: &Erow, rx: u16) -> u16 {
     cx
 }
 
-fn editor_update_row(row: &mut Erow) {
-    let mut tabs = 0;
+fn editor_update_row(row: &mut Erow, syntax: &Option<EditorSyntax>) {
+    let mut _tabs = 0;
 
     let data: Vec<char> = row.chars.chars().collect();
     for j in 0..row.size {
         if data[j] == '\t' {
-            tabs += 1;
+            _tabs += 1;
         }
     }
 
@@ -303,16 +411,21 @@ fn editor_update_row(row: &mut Erow) {
     for j in 0..row.size {
         if data[j] == '\t' {
             rendered.push(' ');
+            idx += 1;
             while idx % EDITOR_TAB_STOP != 0 {
                 rendered.push(' ');
+                idx += 1;
             }
         } else {
             rendered.push(data[j]);
+            idx += 1;
         }
     }
 
     row.render = row.chars.clone();
     row.rsize = row.size;
+
+    editor_update_syntax(row, syntax);
 }
 
 fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
@@ -325,8 +438,9 @@ fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
         chars: String::from(s),
         rsize: 0,
         render: String::new(),
+        hl: vec![],
     };
-    editor_update_row(&mut row);
+    editor_update_row(&mut row, &conf.syntax);
     conf.row.insert(at.into(), row);
     conf.numrows += 1;
     conf.dirty += 1;
@@ -342,7 +456,7 @@ fn editor_del_row(conf: &mut EditorConfig, at: u16) {
 }
 
 fn editor_row_insert_char(conf: &mut EditorConfig, at: u16, c: u8) {
-    let mut row: &mut Erow = &mut conf.row[at as usize];
+    let row: &mut Erow = &mut conf.row[at as usize];
 
     let mut index: usize = conf.cx.into();
     if conf.cx as usize > row.size {
@@ -351,22 +465,22 @@ fn editor_row_insert_char(conf: &mut EditorConfig, at: u16, c: u8) {
 
     row.size += 1;
     row.chars.insert(index, c as char);
-    editor_update_row(row);
+    editor_update_row(row, &conf.syntax);
     conf.dirty += 1;
 }
 
 fn editor_row_append_string(conf: &mut EditorConfig, at: u16, s: &str) {
-    let mut row: &mut Erow = &mut conf.row[at as usize];
+    let row: &mut Erow = &mut conf.row[at as usize];
 
     row.chars.push_str(s);
     row.size += s.len();
 
-    editor_update_row(row);
+    editor_update_row(row, &conf.syntax);
     conf.dirty += 1;
 }
 
 fn editor_row_del_char(conf: &mut EditorConfig, at: u16) {
-    let mut row: &mut Erow = &mut conf.row[at as usize];
+    let row: &mut Erow = &mut conf.row[at as usize];
 
     if conf.cx as usize >= row.size {
         return;
@@ -374,7 +488,7 @@ fn editor_row_del_char(conf: &mut EditorConfig, at: u16) {
 
     row.size -= 1;
     row.chars.remove(conf.cx.into());
-    editor_update_row(row);
+    editor_update_row(row, &conf.syntax);
     conf.dirty += 1;
 }
 
@@ -400,7 +514,7 @@ fn editor_insert_newline(conf: &mut EditorConfig) {
         let mut row = &mut conf.row[cy as usize];
         row.chars = row.chars[..cx as usize].to_string();
         row.size = cx as usize;
-        editor_update_row(&mut row);
+        editor_update_row(&mut row, &conf.syntax);
     }
     conf.cy += 1;
     conf.cx = 0;
@@ -437,6 +551,8 @@ fn editor_rows_to_string(conf: &EditorConfig) -> String {
 fn editor_open(conf: &mut EditorConfig, filename: &str) {
     conf.filename = String::from(filename);
 
+    editor_select_syntax_highlight(conf);
+
     let f = File::open(filename).expect("Can't open a file");
     let mut reader = io::BufReader::new(f);
     let mut line = String::new();
@@ -447,7 +563,7 @@ fn editor_open(conf: &mut EditorConfig, filename: &str) {
             break;
         }
 
-        let mut data: Vec<char> = line.chars().collect();
+        let data: Vec<char> = line.chars().collect();
 
         while linelen > 0 && (data[linelen - 1] == '\n' || data[linelen - 1] == '\r') {
             linelen -= 1;
@@ -469,6 +585,8 @@ fn editor_save(conf: &mut EditorConfig) {
             editor_set_status_message(conf, "Save aborted");
             return;
         }
+
+        editor_select_syntax_highlight(conf);
     }
 
     let buf = editor_rows_to_string(conf);
@@ -496,6 +614,11 @@ fn editor_save(conf: &mut EditorConfig) {
 }
 
 fn editor_find_callback(conf: &mut EditorConfig, query: &str, c: EditorKey) {
+    if !conf.saved_hl.is_empty() {
+        conf.row[conf.saved_hl_line as usize].hl = conf.saved_hl.clone();
+        conf.saved_hl = vec![];
+    }
+
     if matches!(c, EditorKey::Enter | EditorKey::Esc) {
         conf.last_match = -1;
         conf.direction = 1;
@@ -514,7 +637,7 @@ fn editor_find_callback(conf: &mut EditorConfig, query: &str, c: EditorKey) {
     }
     let mut current = conf.last_match;
 
-    for i in 0..conf.numrows {
+    for _ in 0..conf.numrows {
         current += conf.direction;
         if current == -1 {
             current = conf.numrows as i16 - 1;
@@ -522,12 +645,18 @@ fn editor_find_callback(conf: &mut EditorConfig, query: &str, c: EditorKey) {
             current = 0;
         }
 
-        let row = &conf.row[current as usize];
+        let row = &mut conf.row[current as usize];
         if let Some(index) = row.render.find(&query) {
             conf.last_match = current;
             conf.cy = current as u16;
             conf.cx = editor_row_rx_to_cx(row, index as u16);
             conf.rowoff = conf.numrows;
+
+            conf.saved_hl_line = current;
+            conf.saved_hl = row.hl.clone();
+            for j in index..index + query.len() {
+                row.hl[j] = EditorHighlight::HlMatch;
+            }
             break;
         }
     }
@@ -539,7 +668,11 @@ fn editor_find(conf: &mut EditorConfig) {
     let saved_coloff = conf.coloff;
     let saved_rowoff = conf.rowoff;
 
-    let query = editor_prompt(conf, "Search: {} (Use ESC/Arrows/Enter)", Some(editor_find_callback));
+    let query = editor_prompt(
+        conf,
+        "Search: {} (Use ESC/Arrows/Enter)",
+        Some(editor_find_callback),
+    );
 
     if query.is_none() {
         conf.cx = saved_cx;
@@ -613,17 +746,39 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
                 len = conf.screencols as i16;
             }
 
+            let mut current_color = -1;
+
             for j in 0..len as u16 {
                 let index = (conf.coloff + j) as usize;
-                let c = &conf.row[filerow as usize].render[index..].chars().nth(0).unwrap();
-                if c.is_digit(10) {
-                    ab.append("\x1b[31m");
-                    ab.append(&c.to_string());
-                    ab.append("\x1b[39m");
-                } else {
-                    ab.append(&c.to_string());
+                let c = &conf.row[filerow as usize].render[index..]
+                    .chars()
+                    .nth(0)
+                    .unwrap();
+
+                let hl = conf.row[filerow as usize].hl[index];
+                match hl {
+                    EditorHighlight::HlNormal => {
+                        if current_color != -1 {
+                            ab.append("\x1b[39m");
+                            current_color = -1;
+                        }
+                        ab.append(&c.to_string());
+                    }
+                    _ => {
+                        let color = match hl {
+                            EditorHighlight::HlNumber => EditorHighlight::HlNumber,
+                            EditorHighlight::HlMatch => EditorHighlight::HlMatch,
+                            _ => unreachable!(),
+                        } as i8;
+                        if color != current_color {
+                            current_color = color;
+                            ab.append(&format!("\x1b[{}m", color));
+                        }
+                        ab.append(&c.to_string());
+                    }
                 }
             }
+            ab.append("\x1b[39m");
         }
 
         ab.append("\x1b[K");
@@ -644,8 +799,13 @@ fn editor_draw_status_bar(conf: &EditorConfig, ab: &mut Abuf) {
         false => "",
     };
 
+    let syntax = match &conf.syntax {
+        Some(x) => x.filetype,
+        None => "no ft",
+    };
+
     let status = format!("{} - {} lines {}", &filename, conf.numrows, modified);
-    let rstatus = format!("{}/{}", conf.cy + 1, conf.numrows);
+    let rstatus = format!("{} | {}/{}", syntax, conf.cy + 1, conf.numrows);
 
     let mut len = status.len() as u16;
     let rlen = rstatus.len() as u16;
