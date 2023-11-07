@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::str;
+use std::thread::current;
 use std::time::{Duration, SystemTime};
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
@@ -41,6 +42,9 @@ enum EditorKey {
 #[repr(u8)]
 enum EditorHighlight {
     HlNormal = 37,
+    HlComment = 36,
+    HlKeyword1 = 33,
+    HlKeyword2 = 32,
     HlString = 35,
     HlNumber = 31,
     HlMatch = 34,
@@ -53,6 +57,8 @@ const HL_HIGHLIGHT_STRINGS: u32 = 1 << 1;
 struct EditorSyntax<'a> {
     filetype: &'a str,
     filematch: &'a [&'a str],
+    keywords: &'a [&'a str],
+    singleline_comment_start: &'a str,
     flags: u32,
 }
 
@@ -100,10 +106,37 @@ struct EditorConfig<'a> {
 }
 
 static C_HL_EXTENSIONS: &[&str] = &[".c", ".h", ".cpp"];
+static C_HL_KEYWORDS: &[&str] = &[
+    "switch",
+    "if",
+    "while",
+    "for",
+    "break",
+    "continue",
+    "return",
+    "else",
+    "struct",
+    "union",
+    "typedef",
+    "static",
+    "enum",
+    "class",
+    "case",
+    "int|",
+    "long|",
+    "double|",
+    "float|",
+    "char|",
+    "unsigned|",
+    "signed|",
+    "void|",
+];
 
 static HLDB: &[EditorSyntax] = &[EditorSyntax {
     filetype: "c",
     filematch: C_HL_EXTENSIONS,
+    keywords: C_HL_KEYWORDS,
+    singleline_comment_start: "//",
     flags: HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }];
 
@@ -307,10 +340,12 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
     row.hl = vec![EditorHighlight::HlNormal; row.rsize];
     let data: Vec<char> = row.render.chars().collect();
 
-    let flags = match syntax {
-        Some(x) => x.flags,
+    let (flags, keywords, singleline_comment_start) = match syntax {
+        Some(x) => (x.flags, x.keywords, x.singleline_comment_start),
         None => return,
     };
+
+    let scs = singleline_comment_start.chars().collect::<Vec<char>>();
 
     let mut prev_sep = true;
     let mut is_in_string = false;
@@ -324,6 +359,15 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
             true => row.hl[i - 1],
             false => EditorHighlight::HlNormal,
         };
+
+        if !scs.is_empty() && !is_in_string {
+            if i + scs.len() <= data.len() && data[i..i + scs.len()] == scs {
+                (i..row.rsize).for_each(|j| {
+                    row.hl[j] = EditorHighlight::HlComment;
+                });
+                break;
+            }
+        }
 
         if flags & HL_HIGHLIGHT_STRINGS > 0 {
             if is_in_string {
@@ -356,6 +400,38 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
             {
                 row.hl[i] = EditorHighlight::HlNumber;
                 i += 1;
+                prev_sep = false;
+                continue;
+            }
+        }
+
+        if prev_sep {
+            let mut k = 0;
+            for _ in 0..keywords.len() {
+                let kw = keywords[k].chars().collect::<Vec<char>>();
+                let mut klen = kw.len();
+                let kw2 = *kw.last().unwrap() == '|';
+                if kw2 {
+                    klen -= 1;
+                }
+
+                if i + klen <= data.len()
+                    && data[i..i + klen] == kw[..klen]
+                    && is_seprator(data[i + klen])
+                {
+                    (i..i + klen).for_each(|idx| {
+                        row.hl[idx] = if kw2 {
+                            EditorHighlight::HlKeyword2
+                        } else {
+                            EditorHighlight::HlKeyword1
+                        }
+                    });
+                    i += klen;
+                    break;
+                }
+                k += 1;
+            }
+            if k != keywords.len() {
                 prev_sep = false;
                 continue;
             }
@@ -784,6 +860,21 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
                     .nth(0)
                     .unwrap();
 
+                if c.is_control() {
+                    let sym = if c <= &'\x1A' {
+                        char::from_u32((0x40 << 8) | *c as u32).unwrap()
+                    } else {
+                        '?'
+                    };
+
+                    ab.append("\x1b[7m");
+                    ab.append(&sym.to_string());
+                    ab.append("\x1b[m");
+                    if current_color != -1 {
+                        ab.append(&format!("\x1b[{}m", current_color));
+                    }
+                }
+
                 let hl = conf.row[filerow as usize].hl[index];
                 match hl {
                     EditorHighlight::HlNormal => {
@@ -798,6 +889,9 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
                             EditorHighlight::HlNumber => EditorHighlight::HlNumber,
                             EditorHighlight::HlMatch => EditorHighlight::HlMatch,
                             EditorHighlight::HlString => EditorHighlight::HlString,
+                            EditorHighlight::HlComment => EditorHighlight::HlComment,
+                            EditorHighlight::HlKeyword1 => EditorHighlight::HlKeyword1,
+                            EditorHighlight::HlKeyword2 => EditorHighlight::HlKeyword2,
                             _ => unreachable!(),
                         } as i8;
                         if color != current_color {
