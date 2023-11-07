@@ -41,11 +41,13 @@ enum EditorKey {
 #[repr(u8)]
 enum EditorHighlight {
     HlNormal = 37,
+    HlString = 35,
     HlNumber = 31,
     HlMatch = 34,
 }
 
 const HL_HIGHLIGHT_NUMBERS: u32 = 1 << 0;
+const HL_HIGHLIGHT_STRINGS: u32 = 1 << 1;
 
 #[derive(Debug, Clone, Copy)]
 struct EditorSyntax<'a> {
@@ -102,7 +104,7 @@ static C_HL_EXTENSIONS: &[&str] = &[".c", ".h", ".cpp"];
 static HLDB: &[EditorSyntax] = &[EditorSyntax {
     filetype: "c",
     filematch: C_HL_EXTENSIONS,
-    flags: HL_HIGHLIGHT_NUMBERS,
+    flags: HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }];
 
 #[allow(unused)]
@@ -311,6 +313,8 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
     };
 
     let mut prev_sep = true;
+    let mut is_in_string = false;
+    let mut in_string: char = '\0';
     let mut i = 0;
 
     while i < row.rsize {
@@ -320,6 +324,26 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
             true => row.hl[i - 1],
             false => EditorHighlight::HlNormal,
         };
+
+        if flags & HL_HIGHLIGHT_STRINGS > 0 {
+            if is_in_string {
+                row.hl[i] = EditorHighlight::HlString;
+                if c == in_string {
+                    is_in_string = false;
+                }
+                i += 1;
+                prev_sep = true;
+                continue;
+            } else {
+                if c == '"' || c == '\'' {
+                    in_string = c;
+                    is_in_string = true;
+                    row.hl[i] = EditorHighlight::HlString;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
 
         if flags & HL_HIGHLIGHT_NUMBERS > 0 {
             if c.is_digit(10) && (prev_sep == true || matches!(prev_hl, EditorHighlight::HlNumber))
@@ -768,6 +792,7 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
                         let color = match hl {
                             EditorHighlight::HlNumber => EditorHighlight::HlNumber,
                             EditorHighlight::HlMatch => EditorHighlight::HlMatch,
+                            EditorHighlight::HlString => EditorHighlight::HlString,
                             _ => unreachable!(),
                         } as i8;
                         if color != current_color {
