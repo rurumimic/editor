@@ -328,6 +328,11 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
         if flags & HL_HIGHLIGHT_STRINGS > 0 {
             if is_in_string {
                 row.hl[i] = EditorHighlight::HlString;
+                if c == '\\' && i + 1 < row.rsize {
+                    row.hl[i + 1] = EditorHighlight::HlString;
+                    i += 2;
+                    continue;
+                }
                 if c == in_string {
                     is_in_string = false;
                 }
