@@ -1,10 +1,9 @@
 use std::cmp;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::str;
-use std::thread::current;
 use std::time::{Duration, SystemTime};
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
@@ -43,6 +42,7 @@ enum EditorKey {
 enum EditorHighlight {
     HlNormal = 37,
     HlComment = 36,
+    HlMlComment = 38, // -> 36
     HlKeyword1 = 33,
     HlKeyword2 = 32,
     HlString = 35,
@@ -59,6 +59,8 @@ struct EditorSyntax<'a> {
     filematch: &'a [&'a str],
     keywords: &'a [&'a str],
     singleline_comment_start: &'a str,
+    multiline_comment_start: &'a str,
+    multiline_comment_end: &'a str,
     flags: u32,
 }
 
@@ -73,11 +75,13 @@ impl Drop for RawMode {
 
 #[derive(Debug)]
 struct Erow {
+    idx: u16,
     size: usize,
     rsize: usize,
     chars: String,
     render: String,
     hl: Vec<EditorHighlight>,
+    hl_open_comment: bool,
 }
 
 #[allow(dead_code)]
@@ -137,6 +141,8 @@ static HLDB: &[EditorSyntax] = &[EditorSyntax {
     filematch: C_HL_EXTENSIONS,
     keywords: C_HL_KEYWORDS,
     singleline_comment_start: "//",
+    multiline_comment_start: "/*",
+    multiline_comment_end: "*/",
     flags: HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }];
 
@@ -330,24 +336,39 @@ fn is_seprator(c: char) -> bool {
 
     match c {
         ',' | '.' | '(' | ')' | '+' | '-' | '/' | '*' | '=' | '~' | '%' | '<' | '>' | '[' | ']'
-        | '"' => false,
-        _ => true,
+        | '"' => true,
+        _ => false,
     }
 }
 
-#[allow(unused_assignments)]
-fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
+// #[allow(unused_assignments)]
+fn editor_update_syntax(conf: &mut EditorConfig, at: u16) {
+    let idx = conf.row[at as usize].idx as usize;
+    let hl_open_comment = conf.row[idx - 1].hl_open_comment;
+    let row = &mut conf.row[at as usize];
+
+    let syntax = conf.syntax;
     row.hl = vec![EditorHighlight::HlNormal; row.rsize];
     let data: Vec<char> = row.render.chars().collect();
 
-    let (flags, keywords, singleline_comment_start) = match syntax {
-        Some(x) => (x.flags, x.keywords, x.singleline_comment_start),
-        None => return,
-    };
+    let (flags, keywords, singleline_comment_start, multiline_comment_start, multiline_comment_end) =
+        match syntax {
+            Some(x) => (
+                x.flags,
+                x.keywords,
+                x.singleline_comment_start,
+                x.multiline_comment_start,
+                x.multiline_comment_end,
+            ),
+            None => return,
+        };
 
     let scs = singleline_comment_start.chars().collect::<Vec<char>>();
+    let mcs = multiline_comment_start.chars().collect::<Vec<char>>();
+    let mce = multiline_comment_end.chars().collect::<Vec<char>>();
 
     let mut prev_sep = true;
+    let mut is_in_comment = row.idx > 0 && hl_open_comment;
     let mut is_in_string = false;
     let mut in_string: char = '\0';
     let mut i = 0;
@@ -360,12 +381,37 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
             false => EditorHighlight::HlNormal,
         };
 
-        if !scs.is_empty() && !is_in_string {
+        if !scs.is_empty() && !is_in_string && !is_in_comment {
             if i + scs.len() <= data.len() && data[i..i + scs.len()] == scs {
-                (i..row.rsize).for_each(|j| {
-                    row.hl[j] = EditorHighlight::HlComment;
+                (i..row.rsize).for_each(|idx| {
+                    row.hl[idx] = EditorHighlight::HlComment;
                 });
                 break;
+            }
+        }
+
+        if !mcs.is_empty() && !mce.is_empty() && !is_in_string {
+            if is_in_comment {
+                row.hl[i] = EditorHighlight::HlMlComment;
+                if i + mce.len() <= data.len() && data[i..i + mce.len()] == mce {
+                    (i..i + mce.len()).for_each(|idx| {
+                        row.hl[idx] = EditorHighlight::HlMlComment;
+                    });
+                    i += mce.len();
+                    is_in_comment = false;
+                    prev_sep = true;
+                    continue;
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else if i + mcs.len() <= data.len() && data[i..i + mcs.len()] == mcs {
+                (i..i + mcs.len()).for_each(|idx| {
+                    row.hl[idx] = EditorHighlight::HlMlComment;
+                });
+                i += mcs.len();
+                is_in_comment = true;
+                continue;
             }
         }
 
@@ -415,7 +461,7 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
                     klen -= 1;
                 }
 
-                if i + klen <= data.len()
+                if i + klen < data.len()
                     && data[i..i + klen] == kw[..klen]
                     && is_seprator(data[i + klen])
                 {
@@ -424,7 +470,7 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
                             EditorHighlight::HlKeyword2
                         } else {
                             EditorHighlight::HlKeyword1
-                        }
+                        };
                     });
                     i += klen;
                     break;
@@ -440,6 +486,13 @@ fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
         prev_sep = is_seprator(c);
         i += 1;
     }
+
+    let changed = row.hl_open_comment != is_in_comment;
+    row.hl_open_comment = is_in_comment;
+    let next = row.idx + 1;
+    if changed && next < conf.numrows {
+        editor_update_syntax(conf, next);
+    }
 }
 
 fn editor_select_syntax_highlight(conf: &mut EditorConfig) {
@@ -451,16 +504,16 @@ fn editor_select_syntax_highlight(conf: &mut EditorConfig) {
     let extension = conf
         .filename
         .rfind('.')
-        .map(|index| &conf.filename[index..]);
+        .map(|index| conf.filename[index..].to_owned());
 
     match extension {
         Some(ext) => {
             for entry in HLDB {
-                if entry.filematch.contains(&ext) {
+                if entry.filematch.contains(&ext.as_str()) {
                     conf.syntax = Some(*entry);
 
                     for filerow in 0..conf.numrows {
-                        editor_update_syntax(&mut conf.row[filerow as usize], &conf.syntax);
+                        editor_update_syntax(conf, filerow);
                     }
                 }
             }
@@ -501,7 +554,7 @@ fn editor_row_rx_to_cx(row: &mut Erow, rx: u16) -> u16 {
     cx
 }
 
-fn editor_update_row(row: &mut Erow, syntax: &Option<EditorSyntax>) {
+fn editor_update_row(conf: &mut EditorConfig, at: u16, row: &mut Erow) {
     let mut _tabs = 0;
 
     let data: Vec<char> = row.chars.chars().collect();
@@ -530,7 +583,7 @@ fn editor_update_row(row: &mut Erow, syntax: &Option<EditorSyntax>) {
     row.render = row.chars.clone();
     row.rsize = row.size;
 
-    editor_update_syntax(row, syntax);
+    editor_update_syntax(conf, at);
 }
 
 fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
@@ -538,14 +591,21 @@ fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
         return;
     }
 
+    for j in at + 1..conf.numrows {
+        conf.row[j as usize].idx += 1;
+    }
+
     let mut row = Erow {
+        idx: at,
         size: s.len(),
         chars: String::from(s),
         rsize: 0,
         render: String::new(),
         hl: vec![],
+        hl_open_comment: false,
     };
-    editor_update_row(&mut row, &conf.syntax);
+
+    editor_update_row(conf, at, &mut row);
     conf.row.insert(at.into(), row);
     conf.numrows += 1;
     conf.dirty += 1;
@@ -556,6 +616,11 @@ fn editor_del_row(conf: &mut EditorConfig, at: u16) {
         return;
     }
     conf.row.remove(at.into());
+
+    for j in at..conf.numrows - 1 {
+        conf.row[j as usize].idx -= 1;
+    }
+
     conf.numrows -= 1;
     conf.dirty += 1;
 }
@@ -570,7 +635,7 @@ fn editor_row_insert_char(conf: &mut EditorConfig, at: u16, c: u8) {
 
     row.size += 1;
     row.chars.insert(index, c as char);
-    editor_update_row(row, &conf.syntax);
+    editor_update_row(conf, at, row);
     conf.dirty += 1;
 }
 
@@ -580,7 +645,7 @@ fn editor_row_append_string(conf: &mut EditorConfig, at: u16, s: &str) {
     row.chars.push_str(s);
     row.size += s.len();
 
-    editor_update_row(row, &conf.syntax);
+    editor_update_row(conf, at, row);
     conf.dirty += 1;
 }
 
@@ -593,7 +658,7 @@ fn editor_row_del_char(conf: &mut EditorConfig, at: u16) {
 
     row.size -= 1;
     row.chars.remove(conf.cx.into());
-    editor_update_row(row, &conf.syntax);
+    editor_update_row(conf, at, row);
     conf.dirty += 1;
 }
 
@@ -616,10 +681,10 @@ fn editor_insert_newline(conf: &mut EditorConfig) {
         let s = conf.row[cy as usize].chars.clone();
         editor_insert_row(conf, cy + 1, &s[cx as usize..]);
 
-        let mut row = &mut conf.row[cy as usize];
+        let row = &mut conf.row[cy as usize];
         row.chars = row.chars[..cx as usize].to_string();
         row.size = cx as usize;
-        editor_update_row(&mut row, &conf.syntax);
+        editor_update_row(conf, cy, row);
     }
     conf.cy += 1;
     conf.cx = 0;
@@ -660,23 +725,29 @@ fn editor_open(conf: &mut EditorConfig, filename: &str) {
 
     let f = File::open(filename).expect("Can't open a file");
     let mut reader = io::BufReader::new(f);
-    let mut line = String::new();
+    let mut line: Vec<char> = vec![];
+    let mut buffer = [0; 1];
 
-    loop {
-        let mut linelen = reader.read_line(&mut line).expect("Can't read a line");
-        if linelen == 0 {
-            break;
+    while reader.read(&mut buffer).expect("Can't read a file") > 0 {
+        let byte = buffer[0] as char;
+
+        if !byte.is_ascii() {
+            panic!("This is not a ASCII character: {:?}", byte);
         }
 
-        let data: Vec<char> = line.chars().collect();
-
-        while linelen > 0 && (data[linelen - 1] == '\n' || data[linelen - 1] == '\r') {
-            linelen -= 1;
+        if byte == '\n' || byte == '\r' {
+            let string = line.clone().into_iter().collect::<String>();
+            editor_insert_row(conf, conf.numrows, &string);
+            line.clear();
+            continue;
         }
 
-        editor_insert_row(conf, conf.numrows, &line[..linelen]);
+        line.push(byte);
+    }
 
-        line.clear();
+    if line.len() > 0 {
+        let string = line.clone().into_iter().collect::<String>();
+        editor_insert_row(conf, conf.numrows, &string);
     }
 
     conf.dirty = 0;
@@ -890,6 +961,7 @@ fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
                             EditorHighlight::HlMatch => EditorHighlight::HlMatch,
                             EditorHighlight::HlString => EditorHighlight::HlString,
                             EditorHighlight::HlComment => EditorHighlight::HlComment,
+                            EditorHighlight::HlMlComment => EditorHighlight::HlComment,
                             EditorHighlight::HlKeyword1 => EditorHighlight::HlKeyword1,
                             EditorHighlight::HlKeyword2 => EditorHighlight::HlKeyword2,
                             _ => unreachable!(),
