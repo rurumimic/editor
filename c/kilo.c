@@ -972,7 +972,7 @@ void editorRefreshScreen(void) {
   // Ps 2: Erase all of the display
   abAppend(&ab, "\x1b[?25l",
            6); // write 6 bytes. https://vt100.net/docs/vt510-rm/DECTCEM.html
-  abAppend(&ab, "\x1b[H", 3); // CUP – Cursor Position
+  abAppend(&ab, "\x1b[H", 3); // CUP - Cursor Position
 
   editorDrawRows(&ab);
   editorDrawStatusBar(&ab);

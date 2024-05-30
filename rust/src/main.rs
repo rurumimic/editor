@@ -1,10 +1,9 @@
 use std::cmp;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::str;
-use std::thread::current;
 use std::time::{Duration, SystemTime};
 
 use nix::libc::{self, ioctl, TIOCGWINSZ};
@@ -43,6 +42,7 @@ enum EditorKey {
 enum EditorHighlight {
     HlNormal = 37,
     HlComment = 36,
+    HlMlComment = 38, // -> 36
     HlKeyword1 = 33,
     HlKeyword2 = 32,
     HlString = 35,
@@ -59,6 +59,8 @@ struct EditorSyntax<'a> {
     filematch: &'a [&'a str],
     keywords: &'a [&'a str],
     singleline_comment_start: &'a str,
+    multiline_comment_start: &'a str,
+    multiline_comment_end: &'a str,
     flags: u32,
 }
 
@@ -71,13 +73,15 @@ impl Drop for RawMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Erow {
+    idx: u16,
     size: usize,
     rsize: usize,
     chars: String,
     render: String,
     hl: Vec<EditorHighlight>,
+    hl_open_comment: bool,
 }
 
 #[allow(dead_code)]
@@ -137,6 +141,8 @@ static HLDB: &[EditorSyntax] = &[EditorSyntax {
     filematch: C_HL_EXTENSIONS,
     keywords: C_HL_KEYWORDS,
     singleline_comment_start: "//",
+    multiline_comment_start: "/*",
+    multiline_comment_end: "*/",
     flags: HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }];
 
@@ -330,142 +336,200 @@ fn is_seprator(c: char) -> bool {
 
     match c {
         ',' | '.' | '(' | ')' | '+' | '-' | '/' | '*' | '=' | '~' | '%' | '<' | '>' | '[' | ']'
-        | '"' => false,
-        _ => true,
+        | '"' => true,
+        _ => false,
     }
 }
 
-#[allow(unused_assignments)]
-fn editor_update_syntax(row: &mut Erow, syntax: &Option<EditorSyntax>) {
-    row.hl = vec![EditorHighlight::HlNormal; row.rsize];
-    let data: Vec<char> = row.render.chars().collect();
+// #[allow(unused_assignments)]
+impl<'a> EditorConfig<'a> {
+    fn editor_update_syntax(&mut self, at: u16) {
+        let idx = self.row[at as usize].idx as usize;
+        let hl_open_comment = match idx > 0 {
+            true => self.row[idx - 1].hl_open_comment,
+            false => false,
+        };
+        let row = &mut self.row[at as usize];
 
-    let (flags, keywords, singleline_comment_start) = match syntax {
-        Some(x) => (x.flags, x.keywords, x.singleline_comment_start),
-        None => return,
-    };
+        let syntax = self.syntax;
+        row.hl = vec![EditorHighlight::HlNormal; row.rsize];
+        let data: Vec<char> = row.render.chars().collect();
 
-    let scs = singleline_comment_start.chars().collect::<Vec<char>>();
-
-    let mut prev_sep = true;
-    let mut is_in_string = false;
-    let mut in_string: char = '\0';
-    let mut i = 0;
-
-    while i < row.rsize {
-        let c = data[i];
-
-        let prev_hl = match i > 0 {
-            true => row.hl[i - 1],
-            false => EditorHighlight::HlNormal,
+        let (
+            flags,
+            keywords,
+            singleline_comment_start,
+            multiline_comment_start,
+            multiline_comment_end,
+        ) = match syntax {
+            Some(x) => (
+                x.flags,
+                x.keywords,
+                x.singleline_comment_start,
+                x.multiline_comment_start,
+                x.multiline_comment_end,
+            ),
+            None => return,
         };
 
-        if !scs.is_empty() && !is_in_string {
-            if i + scs.len() <= data.len() && data[i..i + scs.len()] == scs {
-                (i..row.rsize).for_each(|j| {
-                    row.hl[j] = EditorHighlight::HlComment;
-                });
-                break;
-            }
-        }
+        let scs = singleline_comment_start.chars().collect::<Vec<char>>();
+        let mcs = multiline_comment_start.chars().collect::<Vec<char>>();
+        let mce = multiline_comment_end.chars().collect::<Vec<char>>();
 
-        if flags & HL_HIGHLIGHT_STRINGS > 0 {
-            if is_in_string {
-                row.hl[i] = EditorHighlight::HlString;
-                if c == '\\' && i + 1 < row.rsize {
-                    row.hl[i + 1] = EditorHighlight::HlString;
-                    i += 2;
-                    continue;
-                }
-                if c == in_string {
-                    is_in_string = false;
-                }
-                i += 1;
-                prev_sep = true;
-                continue;
-            } else {
-                if c == '"' || c == '\'' {
-                    in_string = c;
-                    is_in_string = true;
-                    row.hl[i] = EditorHighlight::HlString;
-                    i += 1;
-                    continue;
-                }
-            }
-        }
+        let mut prev_sep = true;
+        let mut is_in_comment = hl_open_comment;
+        let mut is_in_string = false;
+        let mut in_string: char = '\0';
+        let mut i = 0;
 
-        if flags & HL_HIGHLIGHT_NUMBERS > 0 {
-            if c.is_digit(10) && (prev_sep == true || matches!(prev_hl, EditorHighlight::HlNumber))
-                || (c == '.' && matches!(prev_hl, EditorHighlight::HlNumber))
-            {
-                row.hl[i] = EditorHighlight::HlNumber;
-                i += 1;
-                prev_sep = false;
-                continue;
-            }
-        }
+        while i < row.rsize {
+            let c = data[i];
 
-        if prev_sep {
-            let mut k = 0;
-            for _ in 0..keywords.len() {
-                let kw = keywords[k].chars().collect::<Vec<char>>();
-                let mut klen = kw.len();
-                let kw2 = *kw.last().unwrap() == '|';
-                if kw2 {
-                    klen -= 1;
-                }
+            let prev_hl = match i > 0 {
+                true => row.hl[i - 1],
+                false => EditorHighlight::HlNormal,
+            };
 
-                if i + klen <= data.len()
-                    && data[i..i + klen] == kw[..klen]
-                    && is_seprator(data[i + klen])
-                {
-                    (i..i + klen).for_each(|idx| {
-                        row.hl[idx] = if kw2 {
-                            EditorHighlight::HlKeyword2
-                        } else {
-                            EditorHighlight::HlKeyword1
-                        }
+            if !scs.is_empty() && !is_in_string && !is_in_comment {
+                if i + scs.len() <= data.len() && data[i..i + scs.len()] == scs {
+                    (i..row.rsize).for_each(|idx| {
+                        row.hl[idx] = EditorHighlight::HlComment;
                     });
-                    i += klen;
                     break;
                 }
-                k += 1;
             }
-            if k != keywords.len() {
-                prev_sep = false;
-                continue;
+
+            if !mcs.is_empty() && !mce.is_empty() && !is_in_string {
+                if is_in_comment {
+                    row.hl[i] = EditorHighlight::HlMlComment;
+                    if i + mce.len() <= data.len() && data[i..i + mce.len()] == mce {
+                        (i..i + mce.len()).for_each(|idx| {
+                            row.hl[idx] = EditorHighlight::HlMlComment;
+                        });
+                        i += mce.len();
+                        is_in_comment = false;
+                        prev_sep = true;
+                        continue;
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else if i + mcs.len() <= data.len() && data[i..i + mcs.len()] == mcs {
+                    (i..i + mcs.len()).for_each(|idx| {
+                        row.hl[idx] = EditorHighlight::HlMlComment;
+                    });
+                    i += mcs.len();
+                    is_in_comment = true;
+                    continue;
+                }
             }
-        }
 
-        prev_sep = is_seprator(c);
-        i += 1;
-    }
-}
-
-fn editor_select_syntax_highlight(conf: &mut EditorConfig) {
-    conf.syntax = None;
-    if conf.filename.is_empty() {
-        return;
-    }
-
-    let extension = conf
-        .filename
-        .rfind('.')
-        .map(|index| &conf.filename[index..]);
-
-    match extension {
-        Some(ext) => {
-            for entry in HLDB {
-                if entry.filematch.contains(&ext) {
-                    conf.syntax = Some(*entry);
-
-                    for filerow in 0..conf.numrows {
-                        editor_update_syntax(&mut conf.row[filerow as usize], &conf.syntax);
+            if flags & HL_HIGHLIGHT_STRINGS > 0 {
+                if is_in_string {
+                    row.hl[i] = EditorHighlight::HlString;
+                    if c == '\\' && i + 1 < row.rsize {
+                        row.hl[i + 1] = EditorHighlight::HlString;
+                        i += 2;
+                        continue;
+                    }
+                    if c == in_string {
+                        is_in_string = false;
+                    }
+                    i += 1;
+                    prev_sep = true;
+                    continue;
+                } else {
+                    if c == '"' || c == '\'' {
+                        in_string = c;
+                        is_in_string = true;
+                        row.hl[i] = EditorHighlight::HlString;
+                        i += 1;
+                        continue;
                     }
                 }
             }
+
+            if flags & HL_HIGHLIGHT_NUMBERS > 0 {
+                if c.is_digit(10)
+                    && (prev_sep == true || matches!(prev_hl, EditorHighlight::HlNumber))
+                    || (c == '.' && matches!(prev_hl, EditorHighlight::HlNumber))
+                {
+                    row.hl[i] = EditorHighlight::HlNumber;
+                    i += 1;
+                    prev_sep = false;
+                    continue;
+                }
+            }
+
+            if prev_sep {
+                let mut k = 0;
+                for _ in 0..keywords.len() {
+                    let kw = keywords[k].chars().collect::<Vec<char>>();
+                    let mut klen = kw.len();
+                    let kw2 = *kw.last().unwrap() == '|';
+                    if kw2 {
+                        klen -= 1;
+                    }
+
+                    if i + klen < data.len()
+                        && data[i..i + klen] == kw[..klen]
+                        && is_seprator(data[i + klen])
+                    {
+                        (i..i + klen).for_each(|idx| {
+                            row.hl[idx] = if kw2 {
+                                EditorHighlight::HlKeyword2
+                            } else {
+                                EditorHighlight::HlKeyword1
+                            };
+                        });
+                        i += klen;
+                        break;
+                    }
+                    k += 1;
+                }
+                if k != keywords.len() {
+                    prev_sep = false;
+                    continue;
+                }
+            }
+
+            prev_sep = is_seprator(c);
+            i += 1;
         }
-        None => {}
+
+        let changed = row.hl_open_comment != is_in_comment;
+        row.hl_open_comment = is_in_comment;
+        let next = row.idx + 1;
+        if changed && next < self.numrows {
+            self.editor_update_syntax(next);
+        }
+    }
+
+    fn editor_select_syntax_highlight(&mut self) {
+        self.syntax = None;
+        if self.filename.is_empty() {
+            return;
+        }
+
+        let extension = self
+            .filename
+            .rfind('.')
+            .map(|index| self.filename[index..].to_owned());
+
+        match extension {
+            Some(ext) => {
+                for entry in HLDB {
+                    if entry.filematch.contains(&ext.as_str()) {
+                        self.syntax = Some(*entry);
+
+                        for filerow in 0..self.numrows {
+                            self.editor_update_syntax(filerow);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -501,289 +565,317 @@ fn editor_row_rx_to_cx(row: &mut Erow, rx: u16) -> u16 {
     cx
 }
 
-fn editor_update_row(row: &mut Erow, syntax: &Option<EditorSyntax>) {
-    let mut _tabs = 0;
-
-    let data: Vec<char> = row.chars.chars().collect();
-    for j in 0..row.size {
-        if data[j] == '\t' {
-            _tabs += 1;
+impl Erow {
+    fn new(at: u16, s: &str) -> Erow {
+        Erow {
+            idx: at,
+            size: s.len(),
+            chars: String::from(s),
+            rsize: 0,
+            render: String::new(),
+            hl: vec![],
+            hl_open_comment: false,
         }
     }
+}
 
-    let mut idx = 0;
-    let mut rendered = String::new();
-    for j in 0..row.size {
-        if data[j] == '\t' {
-            rendered.push(' ');
-            idx += 1;
-            while idx % EDITOR_TAB_STOP != 0 {
+impl<'a> EditorConfig<'a> {
+    fn editor_update_row(&mut self, at: u16) {
+        let row: &mut Erow = &mut self.row[at as usize];
+
+        let mut _tabs = 0;
+
+        let data: Vec<char> = row.chars.chars().collect();
+        for j in 0..row.size {
+            if data[j] == '\t' {
+                _tabs += 1;
+            }
+        }
+
+        let mut idx = 0;
+        let mut rendered = String::new();
+        for j in 0..row.size {
+            if data[j] == '\t' {
                 rendered.push(' ');
                 idx += 1;
+                while idx % EDITOR_TAB_STOP != 0 {
+                    rendered.push(' ');
+                    idx += 1;
+                }
+            } else {
+                rendered.push(data[j]);
+                idx += 1;
             }
-        } else {
-            rendered.push(data[j]);
-            idx += 1;
-        }
-    }
-
-    row.render = row.chars.clone();
-    row.rsize = row.size;
-
-    editor_update_syntax(row, syntax);
-}
-
-fn editor_insert_row(conf: &mut EditorConfig, at: u16, s: &str) {
-    if at > conf.numrows {
-        return;
-    }
-
-    let mut row = Erow {
-        size: s.len(),
-        chars: String::from(s),
-        rsize: 0,
-        render: String::new(),
-        hl: vec![],
-    };
-    editor_update_row(&mut row, &conf.syntax);
-    conf.row.insert(at.into(), row);
-    conf.numrows += 1;
-    conf.dirty += 1;
-}
-
-fn editor_del_row(conf: &mut EditorConfig, at: u16) {
-    if at >= conf.numrows {
-        return;
-    }
-    conf.row.remove(at.into());
-    conf.numrows -= 1;
-    conf.dirty += 1;
-}
-
-fn editor_row_insert_char(conf: &mut EditorConfig, at: u16, c: u8) {
-    let row: &mut Erow = &mut conf.row[at as usize];
-
-    let mut index: usize = conf.cx.into();
-    if conf.cx as usize > row.size {
-        index = row.size;
-    }
-
-    row.size += 1;
-    row.chars.insert(index, c as char);
-    editor_update_row(row, &conf.syntax);
-    conf.dirty += 1;
-}
-
-fn editor_row_append_string(conf: &mut EditorConfig, at: u16, s: &str) {
-    let row: &mut Erow = &mut conf.row[at as usize];
-
-    row.chars.push_str(s);
-    row.size += s.len();
-
-    editor_update_row(row, &conf.syntax);
-    conf.dirty += 1;
-}
-
-fn editor_row_del_char(conf: &mut EditorConfig, at: u16) {
-    let row: &mut Erow = &mut conf.row[at as usize];
-
-    if conf.cx as usize >= row.size {
-        return;
-    }
-
-    row.size -= 1;
-    row.chars.remove(conf.cx.into());
-    editor_update_row(row, &conf.syntax);
-    conf.dirty += 1;
-}
-
-fn editor_insert_char(conf: &mut EditorConfig, c: u8) {
-    if conf.cy == conf.numrows {
-        editor_insert_row(conf, conf.numrows, "");
-    }
-
-    editor_row_insert_char(conf, conf.cy, c);
-    conf.cx += 1;
-}
-
-fn editor_insert_newline(conf: &mut EditorConfig) {
-    if conf.cx == 0 {
-        editor_insert_row(conf, conf.cy, "");
-    } else {
-        let cx = conf.cx;
-        let cy = conf.cy;
-
-        let s = conf.row[cy as usize].chars.clone();
-        editor_insert_row(conf, cy + 1, &s[cx as usize..]);
-
-        let mut row = &mut conf.row[cy as usize];
-        row.chars = row.chars[..cx as usize].to_string();
-        row.size = cx as usize;
-        editor_update_row(&mut row, &conf.syntax);
-    }
-    conf.cy += 1;
-    conf.cx = 0;
-}
-
-fn editor_del_char(conf: &mut EditorConfig) {
-    if conf.cy == conf.numrows {
-        return;
-    }
-
-    if conf.cx == 0 && conf.cy == 0 {
-        return;
-    }
-
-    if conf.cx > 0 {
-        conf.cx -= 1;
-        editor_row_del_char(conf, conf.cy);
-    } else {
-        conf.cx = conf.row[conf.cy as usize - 1].size as u16;
-        editor_row_append_string(conf, conf.cy - 1, &conf.row[conf.cy as usize].chars.clone());
-        editor_del_row(conf, conf.cy);
-        conf.cy -= 1;
-    }
-}
-
-fn editor_rows_to_string(conf: &EditorConfig) -> String {
-    conf.row
-        .iter()
-        .map(|erow| erow.chars.as_str())
-        .collect::<Vec<&str>>()
-        .join("\n")
-}
-
-fn editor_open(conf: &mut EditorConfig, filename: &str) {
-    conf.filename = String::from(filename);
-
-    editor_select_syntax_highlight(conf);
-
-    let f = File::open(filename).expect("Can't open a file");
-    let mut reader = io::BufReader::new(f);
-    let mut line = String::new();
-
-    loop {
-        let mut linelen = reader.read_line(&mut line).expect("Can't read a line");
-        if linelen == 0 {
-            break;
         }
 
-        let data: Vec<char> = line.chars().collect();
+        row.render = row.chars.clone();
+        row.rsize = row.size;
 
-        while linelen > 0 && (data[linelen - 1] == '\n' || data[linelen - 1] == '\r') {
-            linelen -= 1;
-        }
-
-        editor_insert_row(conf, conf.numrows, &line[..linelen]);
-
-        line.clear();
+        self.editor_update_syntax(at);
     }
 
-    conf.dirty = 0;
-}
-
-fn editor_save(conf: &mut EditorConfig) {
-    if conf.filename.is_empty() {
-        if let Some(filename) = editor_prompt(conf, "Save as: {} (ESC to cancel)", None) {
-            conf.filename = filename;
-        } else {
-            editor_set_status_message(conf, "Save aborted");
+    fn editor_insert_row(&mut self, at: u16, s: &str) {
+        if at > self.numrows {
             return;
         }
 
-        editor_select_syntax_highlight(conf);
-    }
-
-    let buf = editor_rows_to_string(conf);
-
-    let result = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&conf.filename);
-
-    let (reset_dirty, message) = match result {
-        Ok(mut f) => match f.write_all(buf.as_bytes()) {
-            Ok(_) => (true, format!("{} bytes written to disk", buf.len())),
-            Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
-        },
-        Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
-    };
-
-    if reset_dirty {
-        conf.dirty = 0;
-    }
-
-    editor_set_status_message(conf, &message);
-}
-
-fn editor_find_callback(conf: &mut EditorConfig, query: &str, c: EditorKey) {
-    if !conf.saved_hl.is_empty() {
-        conf.row[conf.saved_hl_line as usize].hl = conf.saved_hl.clone();
-        conf.saved_hl = vec![];
-    }
-
-    if matches!(c, EditorKey::Enter | EditorKey::Esc) {
-        conf.last_match = -1;
-        conf.direction = 1;
-        return;
-    } else if matches!(c, EditorKey::ArrowRight | EditorKey::ArrowDown) {
-        conf.direction = 1;
-    } else if matches!(c, EditorKey::ArrowLeft | EditorKey::ArrowUp) {
-        conf.direction = -1;
-    } else {
-        conf.last_match = -1;
-        conf.direction = 1;
-    }
-
-    if conf.last_match == -1 {
-        conf.direction = 1;
-    }
-    let mut current = conf.last_match;
-
-    for _ in 0..conf.numrows {
-        current += conf.direction;
-        if current == -1 {
-            current = conf.numrows as i16 - 1;
-        } else if current == conf.numrows as i16 {
-            current = 0;
+        for j in at + 1..self.numrows {
+            self.row[j as usize].idx += 1;
         }
 
-        let row = &mut conf.row[current as usize];
-        if let Some(index) = row.render.find(&query) {
-            conf.last_match = current;
-            conf.cy = current as u16;
-            conf.cx = editor_row_rx_to_cx(row, index as u16);
-            conf.rowoff = conf.numrows;
+        self.row.insert(at.into(), Erow::new(at, s));
+        self.editor_update_row(at);
+        self.numrows += 1;
+        self.dirty += 1;
+    }
 
-            conf.saved_hl_line = current;
-            conf.saved_hl = row.hl.clone();
-            for j in index..index + query.len() {
-                row.hl[j] = EditorHighlight::HlMatch;
+    fn editor_del_row(&mut self, at: u16) {
+        if at >= self.numrows {
+            return;
+        }
+        self.row.remove(at.into());
+
+        for j in at..self.numrows - 1 {
+            self.row[j as usize].idx -= 1;
+        }
+
+        self.numrows -= 1;
+        self.dirty += 1;
+    }
+
+    fn editor_row_insert_char(&mut self, at: u16, c: u8) {
+        let row: &mut Erow = &mut self.row[at as usize];
+
+        let mut index: usize = self.cx.into();
+        if self.cx as usize > row.size {
+            index = row.size;
+        }
+
+        row.size += 1;
+        row.chars.insert(index, c as char);
+
+        self.editor_update_row(at);
+        self.dirty += 1;
+    }
+
+    fn editor_row_append_string(&mut self, at: u16, s: &str) {
+        let row: &mut Erow = &mut self.row[at as usize];
+
+        row.chars.push_str(s);
+        row.size += s.len();
+
+        self.editor_update_row(at);
+        self.dirty += 1;
+    }
+
+    fn editor_row_del_char(&mut self, at: u16) {
+        let row: &mut Erow = &mut self.row[at as usize];
+
+        if self.cx as usize >= row.size {
+            return;
+        }
+
+        row.size -= 1;
+        row.chars.remove(self.cx.into());
+
+        self.editor_update_row(at);
+        self.dirty += 1;
+    }
+
+    fn editor_insert_char(&mut self, c: u8) {
+        if self.cy == self.numrows {
+            self.editor_insert_row(self.numrows, "");
+        }
+
+        self.editor_row_insert_char(self.cy, c);
+        self.cx += 1;
+    }
+
+    fn editor_insert_newline(&mut self) {
+        if self.cx == 0 {
+            self.editor_insert_row(self.cy, "");
+        } else {
+            let cx = self.cx;
+            let cy = self.cy;
+
+            let s = self.row[cy as usize].chars.clone();
+            self.editor_insert_row(cy + 1, &s[cx as usize..]);
+
+            let row = &mut self.row[cy as usize];
+            row.chars = row.chars[..cx as usize].to_string();
+            row.size = cx as usize;
+
+            self.editor_update_row(cy);
+        }
+        self.cy += 1;
+        self.cx = 0;
+    }
+
+    fn editor_del_char(&mut self) {
+        if self.cy == self.numrows {
+            return;
+        }
+
+        if self.cx == 0 && self.cy == 0 {
+            return;
+        }
+
+        if self.cx > 0 {
+            self.cx -= 1;
+            self.editor_row_del_char(self.cy);
+        } else {
+            self.cx = self.row[self.cy as usize - 1].size as u16;
+            self.editor_row_append_string(self.cy - 1, &self.row[self.cy as usize].chars.clone());
+            self.editor_del_row(self.cy);
+            self.cy -= 1;
+        }
+    }
+
+    fn editor_rows_to_string(&self) -> String {
+        self.row
+            .iter()
+            .map(|erow| erow.chars.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n")
+    }
+
+    fn editor_open(&mut self, filename: &str) {
+        self.filename = String::from(filename);
+
+        self.editor_select_syntax_highlight();
+
+        let f = File::open(filename).expect("Can't open a file");
+        let mut reader = io::BufReader::new(f);
+        let mut line: Vec<char> = vec![];
+        let mut buffer = [0; 1];
+
+        while reader.read(&mut buffer).expect("Can't read a file") > 0 {
+            let byte = buffer[0] as char;
+
+            if !byte.is_ascii() {
+                panic!("This is not a ASCII character: {:?}", byte);
             }
-            break;
+
+            if byte == '\n' || byte == '\r' {
+                let string = line.clone().into_iter().collect::<String>();
+                self.editor_insert_row(self.numrows, &string);
+                line.clear();
+                continue;
+            }
+
+            line.push(byte);
+        }
+
+        if line.len() > 0 {
+            let string = line.clone().into_iter().collect::<String>();
+            self.editor_insert_row(self.numrows, &string);
+        }
+
+        self.dirty = 0;
+    }
+
+    fn editor_save(&mut self) {
+        if self.filename.is_empty() {
+            if let Some(filename) = self.editor_prompt("Save as: {} (ESC to cancel)", None) {
+                self.filename = filename;
+            } else {
+                self.editor_set_status_message("Save aborted");
+                return;
+            }
+
+            self.editor_select_syntax_highlight();
+        }
+
+        let buf = self.editor_rows_to_string();
+
+        let result = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&self.filename);
+
+        let (reset_dirty, message) = match result {
+            Ok(mut f) => match f.write_all(buf.as_bytes()) {
+                Ok(_) => (true, format!("{} bytes written to disk", buf.len())),
+                Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
+            },
+            Err(e) => (false, format!("Can't save! I/O error: {}", e.to_string())),
+        };
+
+        if reset_dirty {
+            self.dirty = 0;
+        }
+
+        self.editor_set_status_message(&message);
+    }
+
+    fn editor_find_callback(&mut self, query: &str, c: EditorKey) {
+        if !self.saved_hl.is_empty() {
+            self.row[self.saved_hl_line as usize].hl = self.saved_hl.clone();
+            self.saved_hl = vec![];
+        }
+
+        if matches!(c, EditorKey::Enter | EditorKey::Esc) {
+            self.last_match = -1;
+            self.direction = 1;
+            return;
+        } else if matches!(c, EditorKey::ArrowRight | EditorKey::ArrowDown) {
+            self.direction = 1;
+        } else if matches!(c, EditorKey::ArrowLeft | EditorKey::ArrowUp) {
+            self.direction = -1;
+        } else {
+            self.last_match = -1;
+            self.direction = 1;
+        }
+
+        if self.last_match == -1 {
+            self.direction = 1;
+        }
+        let mut current = self.last_match;
+
+        for _ in 0..self.numrows {
+            current += self.direction;
+            if current == -1 {
+                current = self.numrows as i16 - 1;
+            } else if current == self.numrows as i16 {
+                current = 0;
+            }
+
+            let row = &mut self.row[current as usize];
+            if let Some(index) = row.render.find(&query) {
+                self.last_match = current;
+                self.cy = current as u16;
+                self.cx = editor_row_rx_to_cx(row, index as u16);
+                self.rowoff = self.numrows;
+
+                self.saved_hl_line = current;
+                self.saved_hl = row.hl.clone();
+                for j in index..index + query.len() {
+                    row.hl[j] = EditorHighlight::HlMatch;
+                }
+                break;
+            }
         }
     }
-}
 
-fn editor_find(conf: &mut EditorConfig) {
-    let saved_cx = conf.cx;
-    let saved_cy = conf.cy;
-    let saved_coloff = conf.coloff;
-    let saved_rowoff = conf.rowoff;
+    fn editor_find(&mut self) {
+        let saved_cx = self.cx;
+        let saved_cy = self.cy;
+        let saved_coloff = self.coloff;
+        let saved_rowoff = self.rowoff;
 
-    let query = editor_prompt(
-        conf,
-        "Search: {} (Use ESC/Arrows/Enter)",
-        Some(editor_find_callback),
-    );
+        let query = self.editor_prompt(
+            "Search: {} (Use ESC/Arrows/Enter)",
+            Some(EditorConfig::editor_find_callback),
+        );
 
-    if query.is_none() {
-        conf.cx = saved_cx;
-        conf.cy = saved_cy;
-        conf.coloff = saved_coloff;
-        conf.rowoff = saved_rowoff;
+        if query.is_none() {
+            self.cx = saved_cx;
+            self.cy = saved_cy;
+            self.coloff = saved_coloff;
+            self.rowoff = saved_rowoff;
+        }
     }
 }
 
@@ -801,403 +893,408 @@ impl Abuf {
     }
 }
 
-fn editor_scroll(conf: &mut EditorConfig) {
-    conf.rx = 0;
-    if conf.cy < conf.numrows {
-        conf.rx = editor_row_cx_to_rx(&conf.row[conf.cy as usize], conf.cx);
-    }
-
-    if conf.cy < conf.rowoff {
-        conf.rowoff = conf.cy;
-    }
-    if conf.cy >= conf.rowoff + conf.screenrows {
-        conf.rowoff = conf.cy - conf.screenrows + 1;
-    }
-    if conf.rx < conf.coloff {
-        conf.coloff = conf.rx;
-    }
-    if conf.rx >= conf.coloff + conf.screencols {
-        conf.coloff = conf.rx - conf.screencols + 1;
-    }
-}
-
-fn editor_draw_rows(conf: &EditorConfig, ab: &mut Abuf) {
-    for y in 0..conf.screenrows {
-        let filerow = y + conf.rowoff;
-        if filerow >= conf.numrows {
-            if conf.numrows == 0 && y == conf.screenrows / 3 {
-                let welcome = format!("The Editor -- version {}", EDITOR_VERSION);
-                let welcomelen = cmp::min(welcome.len(), conf.screencols.into());
-                let mut padding = (conf.screencols - welcomelen as u16) / 2;
-                if padding > 0 {
-                    ab.append("~");
-                    padding -= 1;
-                }
-                while padding > 0 {
-                    ab.append(" ");
-                    padding -= 1;
-                }
-                ab.append(&welcome[..welcomelen]);
-            } else {
-                ab.append("~");
-            }
-        } else {
-            let mut len = conf.row[filerow as usize].rsize as i16 - conf.coloff as i16;
-
-            if len < 0 {
-                len = 0;
-            }
-            if len > conf.screencols as i16 {
-                len = conf.screencols as i16;
-            }
-
-            let mut current_color = -1;
-
-            for j in 0..len as u16 {
-                let index = (conf.coloff + j) as usize;
-                let c = &conf.row[filerow as usize].render[index..]
-                    .chars()
-                    .nth(0)
-                    .unwrap();
-
-                if c.is_control() {
-                    let sym = if c <= &'\x1A' {
-                        char::from_u32((0x40 << 8) | *c as u32).unwrap()
-                    } else {
-                        '?'
-                    };
-
-                    ab.append("\x1b[7m");
-                    ab.append(&sym.to_string());
-                    ab.append("\x1b[m");
-                    if current_color != -1 {
-                        ab.append(&format!("\x1b[{}m", current_color));
-                    }
-                }
-
-                let hl = conf.row[filerow as usize].hl[index];
-                match hl {
-                    EditorHighlight::HlNormal => {
-                        if current_color != -1 {
-                            ab.append("\x1b[39m");
-                            current_color = -1;
-                        }
-                        ab.append(&c.to_string());
-                    }
-                    _ => {
-                        let color = match hl {
-                            EditorHighlight::HlNumber => EditorHighlight::HlNumber,
-                            EditorHighlight::HlMatch => EditorHighlight::HlMatch,
-                            EditorHighlight::HlString => EditorHighlight::HlString,
-                            EditorHighlight::HlComment => EditorHighlight::HlComment,
-                            EditorHighlight::HlKeyword1 => EditorHighlight::HlKeyword1,
-                            EditorHighlight::HlKeyword2 => EditorHighlight::HlKeyword2,
-                            _ => unreachable!(),
-                        } as i8;
-                        if color != current_color {
-                            current_color = color;
-                            ab.append(&format!("\x1b[{}m", color));
-                        }
-                        ab.append(&c.to_string());
-                    }
-                }
-            }
-            ab.append("\x1b[39m");
+impl<'a> EditorConfig<'a> {
+    fn editor_scroll(&mut self) {
+        self.rx = 0;
+        if self.cy < self.numrows {
+            self.rx = editor_row_cx_to_rx(&self.row[self.cy as usize], self.cx);
         }
 
-        ab.append("\x1b[K");
+        if self.cy < self.rowoff {
+            self.rowoff = self.cy;
+        }
+        if self.cy >= self.rowoff + self.screenrows {
+            self.rowoff = self.cy - self.screenrows + 1;
+        }
+        if self.rx < self.coloff {
+            self.coloff = self.rx;
+        }
+        if self.rx >= self.coloff + self.screencols {
+            self.coloff = self.rx - self.screencols + 1;
+        }
+    }
+
+    fn editor_draw_rows(&self, ab: &mut Abuf) {
+        for y in 0..self.screenrows {
+            let filerow = y + self.rowoff;
+            if filerow >= self.numrows {
+                if self.numrows == 0 && y == self.screenrows / 3 {
+                    let welcome = format!("The Editor -- version {}", EDITOR_VERSION);
+                    let welcomelen = cmp::min(welcome.len(), self.screencols.into());
+                    let mut padding = (self.screencols - welcomelen as u16) / 2;
+                    if padding > 0 {
+                        ab.append("~");
+                        padding -= 1;
+                    }
+                    while padding > 0 {
+                        ab.append(" ");
+                        padding -= 1;
+                    }
+                    ab.append(&welcome[..welcomelen]);
+                } else {
+                    ab.append("~");
+                }
+            } else {
+                let mut len = self.row[filerow as usize].rsize as i16 - self.coloff as i16;
+
+                if len < 0 {
+                    len = 0;
+                }
+                if len > self.screencols as i16 {
+                    len = self.screencols as i16;
+                }
+
+                let mut current_color = -1;
+
+                for j in 0..len as u16 {
+                    let index = (self.coloff + j) as usize;
+                    let c = &self.row[filerow as usize].render[index..]
+                        .chars()
+                        .nth(0)
+                        .unwrap();
+
+                    if c.is_control() {
+                        let sym = if c <= &'\x1A' {
+                            char::from_u32((0x40 << 8) | *c as u32).unwrap()
+                        } else {
+                            '?'
+                        };
+
+                        ab.append("\x1b[7m");
+                        ab.append(&sym.to_string());
+                        ab.append("\x1b[m");
+                        if current_color != -1 {
+                            ab.append(&format!("\x1b[{}m", current_color));
+                        }
+                    }
+
+                    let hl = self.row[filerow as usize].hl[index];
+                    match hl {
+                        EditorHighlight::HlNormal => {
+                            if current_color != -1 {
+                                ab.append("\x1b[39m");
+                                current_color = -1;
+                            }
+                            ab.append(&c.to_string());
+                        }
+                        _ => {
+                            let color = match hl {
+                                EditorHighlight::HlNumber => EditorHighlight::HlNumber,
+                                EditorHighlight::HlMatch => EditorHighlight::HlMatch,
+                                EditorHighlight::HlString => EditorHighlight::HlString,
+                                EditorHighlight::HlComment => EditorHighlight::HlComment,
+                                EditorHighlight::HlMlComment => EditorHighlight::HlComment,
+                                EditorHighlight::HlKeyword1 => EditorHighlight::HlKeyword1,
+                                EditorHighlight::HlKeyword2 => EditorHighlight::HlKeyword2,
+                                _ => unreachable!(),
+                            } as i8;
+                            if color != current_color {
+                                current_color = color;
+                                ab.append(&format!("\x1b[{}m", color));
+                            }
+                            ab.append(&c.to_string());
+                        }
+                    }
+                }
+                ab.append("\x1b[39m");
+            }
+
+            ab.append("\x1b[K");
+            ab.append("\r\n");
+        }
+    }
+
+    fn editor_draw_status_bar(&self, ab: &mut Abuf) {
+        ab.append("\x1b[7m");
+
+        let filename = match self.filename.is_empty() {
+            true => "[No Name]",
+            false => &self.filename,
+        };
+
+        let modified = match self.dirty > 0 {
+            true => "(modified)",
+            false => "",
+        };
+
+        let syntax = match &self.syntax {
+            Some(x) => x.filetype,
+            None => "no ft",
+        };
+
+        let status = format!("{} - {} lines {}", &filename, self.numrows, modified);
+        let rstatus = format!("{} | {}/{}", syntax, self.cy + 1, self.numrows);
+
+        let mut len = status.len() as u16;
+        let rlen = rstatus.len() as u16;
+        if len > self.screencols {
+            len = self.screencols;
+        }
+        ab.append(&status[..len as usize]);
+
+        while len < self.screencols {
+            if self.screencols - len == rlen {
+                ab.append(&rstatus);
+                break;
+            } else {
+                ab.append(" ");
+                len += 1;
+            }
+        }
+
+        ab.append("\x1b[m");
         ab.append("\r\n");
     }
-}
 
-fn editor_draw_status_bar(conf: &EditorConfig, ab: &mut Abuf) {
-    ab.append("\x1b[7m");
-
-    let filename = match conf.filename.is_empty() {
-        true => "[No Name]",
-        false => &conf.filename,
-    };
-
-    let modified = match conf.dirty > 0 {
-        true => "(modified)",
-        false => "",
-    };
-
-    let syntax = match &conf.syntax {
-        Some(x) => x.filetype,
-        None => "no ft",
-    };
-
-    let status = format!("{} - {} lines {}", &filename, conf.numrows, modified);
-    let rstatus = format!("{} | {}/{}", syntax, conf.cy + 1, conf.numrows);
-
-    let mut len = status.len() as u16;
-    let rlen = rstatus.len() as u16;
-    if len > conf.screencols {
-        len = conf.screencols;
-    }
-    ab.append(&status[..len as usize]);
-
-    while len < conf.screencols {
-        if conf.screencols - len == rlen {
-            ab.append(&rstatus);
-            break;
-        } else {
-            ab.append(" ");
-            len += 1;
+    fn editor_draw_message_bar(&self, ab: &mut Abuf) {
+        ab.append("\x1b[K");
+        let mut msglen = self.statusmsg.len();
+        if msglen > self.screencols as usize {
+            msglen = self.screencols as usize;
+        }
+        if msglen > 0
+            && SystemTime::now()
+                .duration_since(self.statusmsg_time)
+                .unwrap()
+                < Duration::new(5, 0)
+        {
+            ab.append(&self.statusmsg);
         }
     }
 
-    ab.append("\x1b[m");
-    ab.append("\r\n");
-}
+    fn editor_refresh_screen(&mut self) {
+        self.editor_scroll();
 
-fn editor_draw_message_bar(conf: &EditorConfig, ab: &mut Abuf) {
-    ab.append("\x1b[K");
-    let mut msglen = conf.statusmsg.len();
-    if msglen > conf.screencols as usize {
-        msglen = conf.screencols as usize;
-    }
-    if msglen > 0
-        && SystemTime::now()
-            .duration_since(conf.statusmsg_time)
-            .unwrap()
-            < Duration::new(5, 0)
-    {
-        ab.append(&conf.statusmsg);
-    }
-}
+        let mut ab = Abuf::new();
 
-fn editor_refresh_screen(conf: &mut EditorConfig) {
-    editor_scroll(conf);
+        ab.append("\x1b[?25l");
+        ab.append("\x1b[H");
 
-    let mut ab = Abuf::new();
+        self.editor_draw_rows(&mut ab);
+        self.editor_draw_status_bar(&mut ab);
+        self.editor_draw_message_bar(&mut ab);
 
-    ab.append("\x1b[?25l");
-    ab.append("\x1b[H");
-
-    editor_draw_rows(conf, &mut ab);
-    editor_draw_status_bar(conf, &mut ab);
-    editor_draw_message_bar(conf, &mut ab);
-
-    let cursor = format!(
-        "\x1b[{};{}H",
-        (conf.cy - conf.rowoff) + 1,
-        (conf.rx - conf.coloff) + 1
-    );
-    ab.append(cursor.as_str());
-
-    ab.append("\x1b[?25h");
-
-    _ = io::stdout().write(ab.b.as_bytes());
-    _ = io::stdout().flush();
-}
-
-fn editor_set_status_message(conf: &mut EditorConfig, fmt: &str) {
-    conf.statusmsg = fmt.to_string();
-    conf.statusmsg_time = SystemTime::now();
-}
-
-fn editor_prompt(
-    conf: &mut EditorConfig,
-    prompt: &str,
-    callback: Option<fn(&mut EditorConfig, &str, EditorKey)>,
-) -> Option<String> {
-    let mut buf = String::new();
-
-    loop {
-        editor_set_status_message(
-            conf,
-            String::from(prompt).replace("{}", buf.as_str()).as_str(),
+        let cursor = format!(
+            "\x1b[{};{}H",
+            (self.cy - self.rowoff) + 1,
+            (self.rx - self.coloff) + 1
         );
-        editor_refresh_screen(conf);
+        ab.append(cursor.as_str());
 
-        let c = editor_read_key();
-        match c {
-            EditorKey::Backspace | EditorKey::DelKey => {
-                if !buf.is_empty() {
-                    buf.pop();
-                }
-            }
-            EditorKey::Esc => {
-                editor_set_status_message(conf, "");
-                callback.as_ref().map(|cb| cb(conf, &buf, c));
-                return None;
-            }
-            EditorKey::Enter => {
-                if !buf.is_empty() {
-                    editor_set_status_message(conf, "");
-                    callback.as_ref().map(|cb| cb(conf, &buf, c));
-                    return Some(buf);
-                }
-            }
-            EditorKey::Key(key) => {
-                if !buf.is_empty() && key == ctrl_key!(b'h') {
-                    buf.pop();
-                } else if !key.is_ascii_control() && key < 128 {
-                    buf.push(key as char);
-                }
-            }
-            _ => {}
-        }
+        ab.append("\x1b[?25h");
 
-        callback.as_ref().map(|cb| cb(conf, &buf, c));
-    }
-}
-
-fn editor_move_cursor(conf: &mut EditorConfig, key: EditorKey) {
-    let mut size: Option<usize> = None;
-    if conf.cy < conf.numrows {
-        size = Some(conf.row[conf.cy as usize].size);
+        _ = io::stdout().write(ab.b.as_bytes());
+        _ = io::stdout().flush();
     }
 
-    match key {
-        EditorKey::ArrowUp => {
-            if conf.cy != 0 {
-                conf.cy -= 1;
-            }
-        }
-        EditorKey::ArrowDown => {
-            if conf.cy < conf.numrows {
-                conf.cy += 1;
-            }
-        }
-        EditorKey::ArrowLeft => {
-            if conf.cx != 0 {
-                conf.cx -= 1;
-            } else if conf.cy > 0 {
-                conf.cy -= 1;
-                conf.cx = conf.row[conf.cy as usize].size as u16;
-            }
-        }
-        EditorKey::ArrowRight => {
-            if let Some(s) = size {
-                if conf.cx < s as u16 {
-                    conf.cx += 1;
-                } else if conf.cx == s as u16 {
-                    conf.cy += 1;
-                    conf.cx = 0;
-                }
-            }
-        }
-        _ => {}
+    fn editor_set_status_message(&mut self, fmt: &str) {
+        self.statusmsg = fmt.to_string();
+        self.statusmsg_time = SystemTime::now();
     }
 
-    if conf.cy < conf.numrows {
-        if conf.cx > conf.row[conf.cy as usize].size as u16 {
-            conf.cx = conf.row[conf.cy as usize].size as u16;
-        }
-    }
-}
+    fn editor_prompt(
+        &mut self,
+        prompt: &str,
+        callback: Option<fn(&mut EditorConfig<'a>, &str, EditorKey)>,
+    ) -> Option<String> {
+        let mut buf = String::new();
 
-fn editor_process_keypress(conf: &mut EditorConfig) -> bool {
-    let c = editor_read_key();
+        loop {
+            self.editor_set_status_message(
+                String::from(prompt).replace("{}", buf.as_str()).as_str(),
+            );
+            self.editor_refresh_screen();
 
-    match c {
-        EditorKey::Key(key) => {
-            if key == ctrl_key!(b'q') {
-                if conf.dirty > 0 && conf.quit_times > 0 {
-                    let message = format!(
-                        "WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
-                        conf.quit_times
-                    );
-                    editor_set_status_message(conf, &message);
-                    conf.quit_times -= 1;
-                    return true;
-                }
-                _ = io::stdout().write(b"\x1b[2J");
-                _ = io::stdout().write(b"\x1b[H");
-                return false;
-            } else if key == ctrl_key!(b'h') {
-                // backspace
-                editor_del_char(conf);
-            } else if key == ctrl_key!(b'l') { // escape
-                 // pass
-            } else if key == ctrl_key!(b's') {
-                editor_save(conf);
-            } else if key == ctrl_key!(b'f') {
-                editor_find(conf);
-            } else {
-                editor_insert_char(conf, key);
-            }
-        }
-        EditorKey::HomeKey => conf.cx = 0,
-        EditorKey::EndKey => {
-            if conf.cy < conf.numrows {
-                conf.cx = conf.row[conf.cy as usize].size as u16;
-            }
-        }
-        EditorKey::Backspace => {
-            editor_del_char(conf);
-        }
-        EditorKey::DelKey => {
-            editor_move_cursor(conf, EditorKey::ArrowRight);
-            editor_del_char(conf);
-        }
-        EditorKey::PageUp | EditorKey::PageDown => {
+            let c = editor_read_key();
             match c {
-                EditorKey::PageUp => conf.cy = conf.rowoff,
-                EditorKey::PageDown => {
-                    conf.cy = conf.rowoff + conf.screenrows - 1;
-                    if conf.cy > conf.numrows {
-                        conf.cy = conf.numrows;
+                EditorKey::Backspace | EditorKey::DelKey => {
+                    if !buf.is_empty() {
+                        buf.pop();
+                    }
+                }
+                EditorKey::Esc => {
+                    self.editor_set_status_message("");
+                    callback.as_ref().map(|cb| cb(self, &buf, c));
+                    return None;
+                }
+                EditorKey::Enter => {
+                    if !buf.is_empty() {
+                        self.editor_set_status_message("");
+                        callback.as_ref().map(|cb| cb(self, &buf, c));
+                        return Some(buf);
+                    }
+                }
+                EditorKey::Key(key) => {
+                    if !buf.is_empty() && key == ctrl_key!(b'h') {
+                        buf.pop();
+                    } else if !key.is_ascii_control() && key < 128 {
+                        buf.push(key as char);
                     }
                 }
                 _ => {}
             }
 
-            let mut times = conf.screenrows;
-            while times > 0 {
-                times -= 1;
-                match c {
-                    EditorKey::PageUp => editor_move_cursor(conf, EditorKey::ArrowUp),
-                    _ => editor_move_cursor(conf, EditorKey::ArrowDown),
-                }
-            }
+            callback.as_ref().map(|cb| cb(self, &buf, c));
         }
-        EditorKey::ArrowUp
-        | EditorKey::ArrowDown
-        | EditorKey::ArrowLeft
-        | EditorKey::ArrowRight => editor_move_cursor(conf, c),
-        EditorKey::Enter => editor_insert_newline(conf),
-        EditorKey::Esc => {}
     }
 
-    conf.quit_times = EDITOR_QUIT_TIMES;
+    fn editor_move_cursor(&mut self, key: EditorKey) {
+        let mut size: Option<usize> = None;
+        if self.cy < self.numrows {
+            size = Some(self.row[self.cy as usize].size);
+        }
 
-    true
+        match key {
+            EditorKey::ArrowUp => {
+                if self.cy != 0 {
+                    self.cy -= 1;
+                }
+            }
+            EditorKey::ArrowDown => {
+                if self.cy < self.numrows {
+                    self.cy += 1;
+                }
+            }
+            EditorKey::ArrowLeft => {
+                if self.cx != 0 {
+                    self.cx -= 1;
+                } else if self.cy > 0 {
+                    self.cy -= 1;
+                    self.cx = self.row[self.cy as usize].size as u16;
+                }
+            }
+            EditorKey::ArrowRight => {
+                if let Some(s) = size {
+                    if self.cx < s as u16 {
+                        self.cx += 1;
+                    } else if self.cx == s as u16 {
+                        self.cy += 1;
+                        self.cx = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if self.cy < self.numrows {
+            if self.cx > self.row[self.cy as usize].size as u16 {
+                self.cx = self.row[self.cy as usize].size as u16;
+            }
+        }
+    }
+
+    fn editor_process_keypress(&mut self) -> bool {
+        let c = editor_read_key();
+
+        match c {
+            EditorKey::Key(key) => {
+                if key == ctrl_key!(b'q') {
+                    if self.dirty > 0 && self.quit_times > 0 {
+                        let message = format!(
+                        "WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                        self.quit_times
+                    );
+                        self.editor_set_status_message(&message);
+                        self.quit_times -= 1;
+                        return true;
+                    }
+                    _ = io::stdout().write(b"\x1b[2J");
+                    _ = io::stdout().write(b"\x1b[H");
+                    return false;
+                } else if key == ctrl_key!(b'h') {
+                    // backspace
+                    self.editor_del_char();
+                } else if key == ctrl_key!(b'l') { // escape
+                     // pass
+                } else if key == ctrl_key!(b's') {
+                    self.editor_save();
+                } else if key == ctrl_key!(b'f') {
+                    self.editor_find();
+                } else {
+                    self.editor_insert_char(key);
+                }
+            }
+            EditorKey::HomeKey => self.cx = 0,
+            EditorKey::EndKey => {
+                if self.cy < self.numrows {
+                    self.cx = self.row[self.cy as usize].size as u16;
+                }
+            }
+            EditorKey::Backspace => {
+                self.editor_del_char();
+            }
+            EditorKey::DelKey => {
+                self.editor_move_cursor(EditorKey::ArrowRight);
+                self.editor_del_char();
+            }
+            EditorKey::PageUp | EditorKey::PageDown => {
+                match c {
+                    EditorKey::PageUp => self.cy = self.rowoff,
+                    EditorKey::PageDown => {
+                        self.cy = self.rowoff + self.screenrows - 1;
+                        if self.cy > self.numrows {
+                            self.cy = self.numrows;
+                        }
+                    }
+                    _ => {}
+                }
+
+                let mut times = self.screenrows;
+                while times > 0 {
+                    times -= 1;
+                    match c {
+                        EditorKey::PageUp => self.editor_move_cursor(EditorKey::ArrowUp),
+                        _ => self.editor_move_cursor(EditorKey::ArrowDown),
+                    }
+                }
+            }
+            EditorKey::ArrowUp
+            | EditorKey::ArrowDown
+            | EditorKey::ArrowLeft
+            | EditorKey::ArrowRight => self.editor_move_cursor(c),
+            EditorKey::Enter => self.editor_insert_newline(),
+            EditorKey::Esc => {}
+        }
+
+        self.quit_times = EDITOR_QUIT_TIMES;
+
+        true
+    }
 }
 
-fn init_editor(conf: &mut EditorConfig) -> bool {
-    let Some((row, col)) = get_window_size() else {
-        return false;
-    };
+impl<'a> EditorConfig<'a> {
+    fn init_editor(&mut self) -> bool {
+        let Some((row, col)) = get_window_size() else {
+            return false;
+        };
 
-    conf.screenrows = row - 2;
-    conf.screencols = col;
-    true
+        self.screenrows = row - 2;
+        self.screencols = col;
+        true
+    }
+
+    fn run(&mut self, args: Vec<String>) {
+        if self.init_editor() == false {
+            return;
+        }
+        if args.len() >= 2 {
+            self.editor_open(&args[1]);
+        }
+
+        self.editor_set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+
+        loop {
+            self.editor_refresh_screen();
+            if self.editor_process_keypress() == false {
+                break;
+            }
+        }
+    }
 }
 
 fn main() {
-    let mut conf: EditorConfig = enable_raw_mode();
-    if init_editor(&mut conf) == false {
-        return;
-    }
-
     let args: Vec<String> = env::args().collect();
-    if args.len() >= 2 {
-        editor_open(&mut conf, &args[1]);
-    }
 
-    editor_set_status_message(
-        &mut conf,
-        "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find",
-    );
-
-    loop {
-        editor_refresh_screen(&mut conf);
-        if editor_process_keypress(&mut conf) == false {
-            break;
-        }
-    }
+    let mut editor: EditorConfig = enable_raw_mode();
+    editor.run(args);
 }
