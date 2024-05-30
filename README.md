@@ -4,10 +4,10 @@
 
 ## Code
 
-| lang | file | progress |
-|---|---|---|
-| C | [kilo.c](c/kilo.c) | ██████ |
-| Rust | [main.rs](rust/src/main.rs) | ██████ |
+| lang | file |
+|---|---|
+| C | [kilo.c](c/kilo.c) |
+| Rust | [main.rs](rust/src/main.rs) |
 
 ## Build and Run
 
