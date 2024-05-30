@@ -7,10 +7,7 @@
 | lang | file | progress |
 |---|---|---|
 | C | [kilo.c](c/kilo.c) | ██████ |
-| C++ | [main.cpp](cpp/main.cpp) | █▒▒▒▒▒ |
-| Go | [main.go](go/main.go) | ██▒▒▒▒ |
 | Rust | [main.rs](rust/src/main.rs) | ██████ |
-| Zig | [main.zig](zig/src/main.zig) | █▒▒▒▒▒ |
 
 ## Build and Run
 
@@ -19,18 +16,8 @@
 make
 ./kilo kilo.c
 
-# c++
-make
-./editor
-
-# go
-go run .
-
 # rust
 cargo run -- src/main.rs
-
-# zig
-zig build run
 ```
 
 ---
