@@ -345,7 +345,10 @@ fn is_seprator(c: char) -> bool {
 impl<'a> EditorConfig<'a> {
     fn editor_update_syntax(&mut self, at: u16) {
         let idx = self.row[at as usize].idx as usize;
-        let hl_open_comment = self.row[idx - 1].hl_open_comment;
+        let hl_open_comment = match idx > 0 {
+            true => self.row[idx - 1].hl_open_comment,
+            false => false,
+        };
         let row = &mut self.row[at as usize];
 
         let syntax = self.syntax;
@@ -374,7 +377,7 @@ impl<'a> EditorConfig<'a> {
         let mce = multiline_comment_end.chars().collect::<Vec<char>>();
 
         let mut prev_sep = true;
-        let mut is_in_comment = row.idx > 0 && hl_open_comment;
+        let mut is_in_comment = hl_open_comment;
         let mut is_in_string = false;
         let mut in_string: char = '\0';
         let mut i = 0;
@@ -562,8 +565,24 @@ fn editor_row_rx_to_cx(row: &mut Erow, rx: u16) -> u16 {
     cx
 }
 
+impl Erow {
+    fn new(at: u16, s: &str) -> Erow {
+        Erow {
+            idx: at,
+            size: s.len(),
+            chars: String::from(s),
+            rsize: 0,
+            render: String::new(),
+            hl: vec![],
+            hl_open_comment: false,
+        }
+    }
+}
+
 impl<'a> EditorConfig<'a> {
-    fn editor_update_row(&mut self, at: u16, row: Erow) -> Erow {
+    fn editor_update_row(&mut self, at: u16) {
+        let row: &mut Erow = &mut self.row[at as usize];
+
         let mut _tabs = 0;
 
         let data: Vec<char> = row.chars.chars().collect();
@@ -589,14 +608,10 @@ impl<'a> EditorConfig<'a> {
             }
         }
 
-        let mut row = row.clone();
-
         row.render = row.chars.clone();
         row.rsize = row.size;
 
         self.editor_update_syntax(at);
-
-        row
     }
 
     fn editor_insert_row(&mut self, at: u16, s: &str) {
@@ -608,18 +623,8 @@ impl<'a> EditorConfig<'a> {
             self.row[j as usize].idx += 1;
         }
 
-        let row = Erow {
-            idx: at,
-            size: s.len(),
-            chars: String::from(s),
-            rsize: 0,
-            render: String::new(),
-            hl: vec![],
-            hl_open_comment: false,
-        };
-
-        let row = self.editor_update_row(at, row);
-        self.row.insert(at.into(), row);
+        self.row.insert(at.into(), Erow::new(at, s));
+        self.editor_update_row(at);
         self.numrows += 1;
         self.dirty += 1;
     }
@@ -640,7 +645,7 @@ impl<'a> EditorConfig<'a> {
 
     fn editor_row_insert_char(&mut self, at: u16, c: u8) {
         let row: &mut Erow = &mut self.row[at as usize];
-        
+
         let mut index: usize = self.cx.into();
         if self.cx as usize > row.size {
             index = row.size;
@@ -649,10 +654,7 @@ impl<'a> EditorConfig<'a> {
         row.size += 1;
         row.chars.insert(index, c as char);
 
-        let row_cloned = row.clone();
-
-        self.row[at as usize] = self.editor_update_row(at, row_cloned);
-
+        self.editor_update_row(at);
         self.dirty += 1;
     }
 
@@ -662,8 +664,7 @@ impl<'a> EditorConfig<'a> {
         row.chars.push_str(s);
         row.size += s.len();
 
-        let row_cloned = row.clone();
-        self.row[at as usize] = self.editor_update_row(at, row_cloned);
+        self.editor_update_row(at);
         self.dirty += 1;
     }
 
@@ -676,8 +677,8 @@ impl<'a> EditorConfig<'a> {
 
         row.size -= 1;
         row.chars.remove(self.cx.into());
-        let row_cloned = row.clone();
-        self.row[at as usize] = self.editor_update_row(at, row_cloned);
+
+        self.editor_update_row(at);
         self.dirty += 1;
     }
 
@@ -703,8 +704,8 @@ impl<'a> EditorConfig<'a> {
             let row = &mut self.row[cy as usize];
             row.chars = row.chars[..cx as usize].to_string();
             row.size = cx as usize;
-            let row_cloned = row.clone();
-            self.row[cy as usize] = self.editor_update_row(cy, row_cloned);
+
+            self.editor_update_row(cy);
         }
         self.cy += 1;
         self.cx = 0;
