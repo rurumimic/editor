@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+cjk = "0.2.5"
 nix = { version = "0.26.2", features = ["term", "ioctl"] }
 termios = "0.3.3"
 
