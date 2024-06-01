@@ -1150,7 +1150,7 @@ impl<'a> EditorConfig<'a> {
             && SystemTime::now()
                 .duration_since(self.statusmsg_time)
                 .unwrap()
-                < Duration::new(20, 0)
+                < Duration::new(5, 0)
         {
             ab.append(&self.statusmsg);
         }
