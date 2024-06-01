@@ -2,7 +2,7 @@
 
 ![rust](images/rust.png)
 
-## Build and Edit
+## Edit
 
 [rust/src/main.rs](rust/src/main.rs)
 
@@ -16,18 +16,18 @@ ______________________________________________________________________
 
 ### kilo
 
-- kilo: [github](https://github.com/antirez/kilo)
-  - [Blog](http://antirez.com/news/108): Writing an editor in less than 1000
-    lines of code, just for fun
-  - [Tutorial](https://viewsourcecode.org/snaptoken/kilo/): Build Your Own Text
-    Editor
-
-code: [c/kilo.c](c/kilo.c)
+[c/kilo.c](c/kilo.c)
 
 ```bash
 make
 ./kilo kilo.c
 ```
+
+- kilo: [github](https://github.com/antirez/kilo)
+  - [Blog](http://antirez.com/news/108): Writing an editor in less than 1000
+    lines of code, just for fun
+  - [Tutorial](https://viewsourcecode.org/snaptoken/kilo/): Build Your Own Text
+    Editor
 
 ### Blogs
 
