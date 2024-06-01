@@ -2,22 +2,19 @@
 
 ![rust](images/rust.png)
 
-## Code
-
-| lang | file                        |
-| ---- | --------------------------- |
-| Rust | [main.rs](rust/src/main.rs) |
-| C    | [kilo.c](c/kilo.c)          |
-
-## Build and Run
+## Build and Edit
 
 ### Rust Editor
+
+[rust/src/main.rs](rust/src/main.rs)
 
 ```bash
 cargo run -- src/main.rs
 ```
 
 ### C Editor
+
+[c/kilo.c](c/kilo.c)
 
 ```bash
 make
