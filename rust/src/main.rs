@@ -11,7 +11,7 @@ use nix::libc::{self, ioctl, TIOCGWINSZ};
 use nix::pty::Winsize;
 use termios::*;
 
-const EDITOR_VERSION: &'static str = "0.0.1";
+const EDITOR_VERSION: &'static str = "0.1.0";
 const EDITOR_TAB_STOP: u16 = 8;
 const EDITOR_QUIT_TIMES: u16 = 3;
 
