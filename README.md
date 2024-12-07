@@ -7,8 +7,16 @@
 [rust/src/main.rs](rust/src/main.rs)
 
 ```bash
+cd rust
 cargo run -- src/main.rs
 ```
+
+### Features
+
+- Edit a file: read, write
+- Search
+- Highlights: C, Rust
+- Display CJK Characters
 
 ______________________________________________________________________
 
